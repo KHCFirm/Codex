@@ -1,34 +1,22 @@
-# pip install pdfplumber python-dateutil pypdf rich
-"""CLI tool to parse healthcare claim PDFs.
+"""Claim PDF parser for HCFA-1500 and EOB documents.
 
-This module provides `HcfaParser` and `EobParser` classes for extracting
-fields from text-based PDF documents.  The main script accepts a path or
-glob of PDF files, classifies each as either an HCFA-1500 claim form or an
-Explanation of Benefits (EOB), and outputs JSON records for each file.
+This module exposes helper functions for extracting text from PDF files
+and parsing common fields from healthcare claims. It provides two simple
+parsers ``HcfaParser`` and ``EobParser`` with a unified ``parse_file``
+entry point.  The goal is to keep the parsing logic easy to extend while
+remaining lightweight so it can run in limited environments such as
+Streamlit Cloud.
 """
-
 from __future__ import annotations
 
-import argparse
-import glob
-import json
-import logging
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, asdict, field
 from decimal import Decimal
 from pathlib import Path
-from typing import List, Optional
-
-from rich.console import Console
-from rich.table import Table
+from typing import List, Optional, Dict
+import re
 
 import pdfplumber
 from dateutil import parser as dateparser
-
-
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-logger = logging.getLogger(__name__)
-console = Console()
 
 
 # ---------------------------------------------------------------------------
@@ -36,9 +24,11 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 def parse_money(value: str) -> Optional[Decimal]:
-    """Convert a currency string to ``Decimal``.
+    """Parse a currency string into ``Decimal``.
 
-    Returns ``None`` if conversion fails.
+    This helper strips common currency formatting and also supports
+    parentheses for negative amounts.  It returns ``None`` when the value
+    cannot be converted.
     """
     if not value:
         return None
@@ -51,173 +41,148 @@ def parse_money(value: str) -> Optional[Decimal]:
         amount = Decimal(cleaned)
         return -amount if negative else amount
     except Exception:
-        logger.debug("Failed to parse money value: %s", value)
+        return None
+
+
+def parse_date(value: str) -> Optional[str]:
+    """Convert various date strings to ISO ``YYYY-MM-DD`` format."""
+    if not value:
+        return None
+    try:
+        return dateparser.parse(value, fuzzy=True).date().isoformat()
+    except Exception:
         return None
 
 
 @dataclass
 class ServiceLine:
-    date_of_service: Optional[str] = None
-    place_of_service: Optional[str] = None
     cpt_code: Optional[str] = None
     charge: Optional[Decimal] = None
-    rendering_npi: Optional[str] = None
     patient_responsibility: Optional[Decimal] = None
     insurance_paid: Optional[Decimal] = None
 
 
 # ---------------------------------------------------------------------------
-# Classification logic
+# Classification
 # ---------------------------------------------------------------------------
-
 HCFA_KEYWORDS = [
     "CMS-1500",
     "HCFA",
-    "1a.",
-    "24J.",
+    "24J",
     "CLAIM FORM",
-    "HCFA-1500",
 ]
+
 EOB_KEYWORDS = [
     "EXPLANATION OF BENEFITS",
     "EOB",
-    "PATIENT RESPONSIBILITY",
     "CLAIM SUMMARY",
+    "PATIENT RESPONSIBILITY",
 ]
 
 
 def classify_text(text: str) -> Optional[str]:
-    """Return ``HCFA`` or ``EOB`` if keywords indicate document type."""
+    """Return ``HCFA`` or ``EOB`` based on keyword presence."""
     upper = text.upper()
-    if any(k.upper() in upper for k in HCFA_KEYWORDS):
+    if any(k in upper for k in HCFA_KEYWORDS):
         return "HCFA"
-    if any(k.upper() in upper for k in EOB_KEYWORDS):
+    if any(k in upper for k in EOB_KEYWORDS):
         return "EOB"
     return None
 
 
 # ---------------------------------------------------------------------------
-# PDF extraction helpers
+# PDF text extraction
 # ---------------------------------------------------------------------------
 
-def extract_text_from_pdf(pdf_path: Path) -> str:
-    """Extract all text from a PDF using pdfplumber."""
-    text_parts = []
+def extract_text(pdf_path: Path) -> str:
+    """Extract text from a PDF using ``pdfplumber``."""
+    text_parts: List[str] = []
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page in pdf.pages:
-            page_text = page.extract_text(x_tolerance=2, y_tolerance=2)
+            page_text = page.extract_text(x_tolerance=1, y_tolerance=1)
             if page_text:
                 text_parts.append(page_text)
     return "\n".join(text_parts)
 
 
 # ---------------------------------------------------------------------------
-# HCFA Parser
+# Parsers
 # ---------------------------------------------------------------------------
 
 @dataclass
 class HcfaParser:
     text: str
-    result: dict = field(default_factory=dict)
+    result: Dict[str, object] = field(default_factory=dict)
 
-    def parse(self) -> dict:
-        self.result = {
-            "doc_type": "HCFA",
-            "patient_name": self._find_field(r"PATIENT'S NAME[^\n]*?\n(.+)", group=1),
-            "patient_dob": self._parse_date(self._find_field(r"3\.\s*DATE OF BIRTH[^\n]*?\n(.+)", 1)),
-            "patient_address": self._find_field(r"5\.\s*PATIENT ADDRESS[^\n]*?\n(.+)", 1),
-            "insured_id": self._find_field(r"1A\.\s*INSURED'S ID NUMBER[^\n]*?\n(.+)", 1),
-            "diagnosis_codes": self._find_all(r"21\.\s*DIAGNOSIS[^\n]*?\n(.+)", 1),
-            "service_lines": self._parse_service_lines(),
-            "federal_tax_id": self._find_field(r"25\.\s*FEDERAL TAX ID NUMBER[^\n]*?\n(.+)", 1),
-            "physician_signature": self._find_field(r"31\.\s*SIGNATURE[^\n]*?\n(.+)", 1),
-            "service_facility": self._find_field(r"32\.\s*SERVICE FACILITY LOCATION[^\n]*?\n(.+)", 1),
-            "billing_npi": self._find_field(r"33A\.\s*NPI[^\n]*?\n(.+)", 1),
-        }
+    FIELD_PATTERNS = {
+        "patient_name": r"PATIENT'S NAME[^\n]*\n(.+)",
+        "insured_id": r"1A\.\s*INSURED'S ID NUMBER[^\n]*\n(.+)",
+        "patient_address": r"5\.\s*PATIENT ADDRESS[^\n]*\n(.+)",
+        "federal_tax_id": r"25\.\s*FEDERAL TAX ID NUMBER[^\n]*\n(.+)",
+        "billing_npi": r"33A\.\s*NPI[^\n]*\n(.+)",
+    }
+
+    def parse(self) -> Dict[str, object]:
+        self.result = {"doc_type": "HCFA"}
+        for field_name, pattern in self.FIELD_PATTERNS.items():
+            value = self._find_field(pattern)
+            if value:
+                self.result[field_name] = value
+        dob = self._find_field(r"3\.\s*DATE OF BIRTH[^\n]*\n(.+)")
+        if dob:
+            self.result["patient_dob"] = parse_date(dob)
+        self.result["service_lines"] = self._parse_service_lines()
         return self.result
 
-    def _find_field(self, pattern: str, group: int = 0) -> Optional[str]:
+    def _find_field(self, pattern: str) -> Optional[str]:
         m = re.search(pattern, self.text, re.IGNORECASE)
-        return m.group(group).strip() if m else None
+        return m.group(1).strip() if m else None
 
-    def _find_all(self, pattern: str, group: int = 0) -> List[str]:
-        matches = re.findall(pattern, self.text, flags=re.IGNORECASE)
-        return [m.strip() for m in matches]
-
-    def _parse_date(self, value: Optional[str]) -> Optional[str]:
-        if not value:
-            return None
-        try:
-            return dateparser.parse(value, fuzzy=True).date().isoformat()
-        except Exception:
-            logger.debug("Failed to parse date: %s", value)
-            return None
-
-    def _parse_service_lines(self) -> List[dict]:
-        lines = []
-        pattern = re.compile(r"24A.*24B.*24D.*24F.*24J", re.IGNORECASE)
-        header_match = pattern.search(self.text)
-        if not header_match:
-            return lines
-        header_end = header_match.end()
-        body = self.text[header_end:].splitlines()
+    def _parse_service_lines(self) -> List[Dict[str, object]]:
+        # Very simple service line parser: look for lines after the 24A header
+        header = re.search(r"24A.*24B.*24D.*24F.*24J", self.text, re.IGNORECASE)
+        if not header:
+            return []
+        lines: List[Dict[str, object]] = []
+        body = self.text[header.end():].splitlines()
         for raw in body:
             cols = raw.split()
-            if len(cols) < 5:
+            if len(cols) < 4:
                 continue
             line = ServiceLine(
-                date_of_service=cols[0],
-                place_of_service=cols[1],
                 cpt_code=cols[2],
                 charge=parse_money(cols[3]),
-                rendering_npi=cols[4],
             )
-            lines.append({k: v for k, v in line.__dict__.items() if v is not None})
+            lines.append({k: v for k, v in asdict(line).items() if v is not None})
         return lines
 
-
-# ---------------------------------------------------------------------------
-# EOB Parser
-# ---------------------------------------------------------------------------
 
 @dataclass
 class EobParser:
     text: str
-    result: dict = field(default_factory=dict)
+    result: Dict[str, object] = field(default_factory=dict)
 
-    def parse(self) -> dict:
-        self.result = {
-            "doc_type": "EOB",
-            "eob_date": self._find_date(),
-            "claim_number": self._find_field(r"CLAIM NUMBER[:\s]*([A-Z0-9-]+)", 1),
-            "service_lines": self._parse_service_lines(),
-        }
+    def parse(self) -> Dict[str, object]:
+        self.result = {"doc_type": "EOB"}
+        date = self._find_field(r"(?:Payment|Check|Printed) Date\s*[:\-]?\s*([^\n]+)")
+        if date:
+            self.result["eob_date"] = parse_date(date)
+        claim = self._find_field(r"CLAIM NUMBER[:\s]*([A-Z0-9-]+)")
+        if claim:
+            self.result["claim_number"] = claim
+        self.result["service_lines"] = self._parse_service_lines()
         return self.result
 
-    def _find_field(self, pattern: str, group: int = 0) -> Optional[str]:
+    def _find_field(self, pattern: str) -> Optional[str]:
         m = re.search(pattern, self.text, re.IGNORECASE)
-        return m.group(group).strip() if m else None
+        return m.group(1).strip() if m else None
 
-    def _find_date(self) -> Optional[str]:
-        for label in ["Payment Date", "Check Date", "Printed Date"]:
-            m = re.search(label + r"[:\s]*([^\n]+)", self.text, re.IGNORECASE)
-            if m:
-                try:
-                    return dateparser.parse(m.group(1), fuzzy=True).date().isoformat()
-                except Exception:
-                    logger.debug("Failed to parse date: %s", m.group(1))
-        return None
-
-    def _parse_service_lines(self) -> List[dict]:
-        lines = []
-        pattern = re.compile(r"CPT\s+CODE", re.IGNORECASE)
-        header_match = pattern.search(self.text)
-        if not header_match:
-            return lines
-        body = self.text[header_match.end():].splitlines()
-        for raw in body:
-            if not raw.strip():
-                continue
+    def _parse_service_lines(self) -> List[Dict[str, object]]:
+        header = re.search(r"CPT\s+CODE", self.text, re.IGNORECASE)
+        if not header:
+            return []
+        lines: List[Dict[str, object]] = []
+        for raw in self.text[header.end():].splitlines():
             cols = raw.split()
             if len(cols) < 4:
                 continue
@@ -227,16 +192,16 @@ class EobParser:
                 patient_responsibility=parse_money(cols[2]),
                 insurance_paid=parse_money(cols[3]),
             )
-            lines.append({k: v for k, v in line.__dict__.items() if v is not None})
+            lines.append({k: v for k, v in asdict(line).items() if v is not None})
         return lines
 
 
 # ---------------------------------------------------------------------------
-# Main command-line interface
+# High-level entry point
 # ---------------------------------------------------------------------------
 
-def parse_file(path: Path) -> dict:
-    text = extract_text_from_pdf(path)
+def parse_file(path: Path) -> Dict[str, object]:
+    text = extract_text(path)
     doc_type = classify_text(text) or "UNKNOWN"
     if doc_type == "HCFA":
         parser = HcfaParser(text)
@@ -250,46 +215,11 @@ def parse_file(path: Path) -> dict:
     return result
 
 
-def pretty_print(results: List[dict]) -> None:
-    for record in results:
-        console.rule(f"[bold blue]{record.get('source_file', '')}")
-        meta = {k: v for k, v in record.items() if k != "service_lines"}
-        console.print_json(json.dumps(meta))
-        lines = record.get("service_lines") or []
-        if lines:
-            table = Table(show_header=True, header_style="bold magenta")
-            for key in lines[0].keys():
-                table.add_column(key)
-            for line in lines:
-                table.add_row(*(str(line.get(k, "")) for k in lines[0].keys()))
-            console.print(table)
-
-
-def main(argv: Optional[List[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="Parse claim PDFs")
-    parser.add_argument("input", help="Input file path or glob")
-    parser.add_argument("--output", help="Output JSON file path", default=None)
-    parser.add_argument("--pretty", action="store_true", help="Pretty output with rich")
-    args = parser.parse_args(argv)
-
-    paths = [Path(p) for p in glob.glob(args.input)]
-    results = []
-    for p in paths:
-        logger.info("Processing %s", p)
-        try:
-            results.append(parse_file(p))
-        except Exception as exc:
-            logger.error("Failed to parse %s: %s", p, exc)
-    output = json.dumps(results, indent=2)
-    if args.output:
-        Path(args.output).write_text(output)
-        if args.pretty:
-            console.print(f"[green]Results written to {args.output}")
-    elif args.pretty:
-        pretty_print(results)
-    else:
-        print(output)
-
-
-if __name__ == "__main__":
-    main()
+__all__ = [
+    "parse_file",
+    "classify_text",
+    "parse_money",
+    "extract_text",
+    "HcfaParser",
+    "EobParser",
+]
