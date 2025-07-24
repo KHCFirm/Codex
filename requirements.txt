@@ -1,0 +1,5 @@
+Flask
+pdfplumber
+python-dateutil
+pypdf
+rich

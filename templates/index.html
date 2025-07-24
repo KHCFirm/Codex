@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Claim PDF Parser</title>
+    <style>
+        body { font-family: sans-serif; margin: 2em; }
+        #dropzone { border: 2px dashed #ccc; padding: 2em; text-align: center; color: #777; }
+        #dropzone.dragover { border-color: #333; color: #333; }
+        pre { background: #f4f4f4; padding: 1em; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h1>Upload Claim PDFs</h1>
+    <div id="dropzone">Drag & Drop PDFs here or click to select</div>
+    <input type="file" id="fileInput" multiple accept="application/pdf" style="display:none" />
+    <pre id="output"></pre>
+    <script>
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('fileInput');
+    dropzone.addEventListener('click', () => fileInput.click());
+    dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop', e => { e.preventDefault(); dropzone.classList.remove('dragover'); handleFiles(e.dataTransfer.files); });
+    fileInput.addEventListener('change', () => handleFiles(fileInput.files));
+    function handleFiles(files) {
+        const formData = new FormData();
+        for (const f of files) formData.append('files', f);
+        fetch('/upload', { method: 'POST', body: formData })
+            .then(r => r.json())
+            .then(data => { document.getElementById('output').textContent = JSON.stringify(data, null, 2); })
+            .catch(err => alert('Error: ' + err));
+    }
+    </script>
+</body>
+</html>
