@@ -12,6 +12,13 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+For OCR support you also need Tesseract and poppler utilities available on
+your system. On Ubuntu:
+
+```bash
+apt-get update && apt-get install -y tesseract-ocr poppler-utils
+```
+
 ## Command-line usage
 
 ```bash

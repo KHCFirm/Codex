@@ -16,6 +16,8 @@ from typing import List, Optional, Dict
 import re
 
 import pdfplumber
+from pdf2image import convert_from_path
+import pytesseract
 from dateutil import parser as dateparser
 
 
@@ -95,14 +97,23 @@ def classify_text(text: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def extract_text(pdf_path: Path) -> str:
-    """Extract text from a PDF using ``pdfplumber``."""
+    """Extract text from a PDF using ``pdfplumber`` with OCR fallback."""
     text_parts: List[str] = []
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page in pdf.pages:
             page_text = page.extract_text(x_tolerance=1, y_tolerance=1)
             if page_text:
                 text_parts.append(page_text)
-    return "\n".join(text_parts)
+    text = "\n".join(text_parts).strip()
+    if text:
+        return text
+    try:
+        images = convert_from_path(str(pdf_path))
+        for img in images:
+            text_parts.append(pytesseract.image_to_string(img))
+        return "\n".join(text_parts)
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
