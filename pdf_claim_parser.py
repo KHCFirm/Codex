@@ -19,12 +19,16 @@ from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional
 
+from rich.console import Console
+from rich.table import Table
+
 import pdfplumber
 from dateutil import parser as dateparser
 
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+console = Console()
 
 
 # ---------------------------------------------------------------------------
@@ -38,9 +42,14 @@ def parse_money(value: str) -> Optional[Decimal]:
     """
     if not value:
         return None
-    cleaned = re.sub(r"[^0-9.-]", "", value)
+    cleaned = value.strip()
+    negative = cleaned.startswith("(") and cleaned.endswith(")")
+    if negative:
+        cleaned = cleaned[1:-1]
+    cleaned = re.sub(r"[^0-9.-]", "", cleaned)
     try:
-        return Decimal(cleaned)
+        amount = Decimal(cleaned)
+        return -amount if negative else amount
     except Exception:
         logger.debug("Failed to parse money value: %s", value)
         return None
@@ -61,8 +70,20 @@ class ServiceLine:
 # Classification logic
 # ---------------------------------------------------------------------------
 
-HCFA_KEYWORDS = ["CMS-1500", "HCFA", "1a.", "24J."]
-EOB_KEYWORDS = ["EXPLANATION OF BENEFITS", "EOB", "Patient Responsibility"]
+HCFA_KEYWORDS = [
+    "CMS-1500",
+    "HCFA",
+    "1a.",
+    "24J.",
+    "CLAIM FORM",
+    "HCFA-1500",
+]
+EOB_KEYWORDS = [
+    "EXPLANATION OF BENEFITS",
+    "EOB",
+    "PATIENT RESPONSIBILITY",
+    "CLAIM SUMMARY",
+]
 
 
 def classify_text(text: str) -> Optional[str]:
@@ -229,10 +250,26 @@ def parse_file(path: Path) -> dict:
     return result
 
 
+def pretty_print(results: List[dict]) -> None:
+    for record in results:
+        console.rule(f"[bold blue]{record.get('source_file', '')}")
+        meta = {k: v for k, v in record.items() if k != "service_lines"}
+        console.print_json(json.dumps(meta))
+        lines = record.get("service_lines") or []
+        if lines:
+            table = Table(show_header=True, header_style="bold magenta")
+            for key in lines[0].keys():
+                table.add_column(key)
+            for line in lines:
+                table.add_row(*(str(line.get(k, "")) for k in lines[0].keys()))
+            console.print(table)
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Parse claim PDFs")
     parser.add_argument("input", help="Input file path or glob")
     parser.add_argument("--output", help="Output JSON file path", default=None)
+    parser.add_argument("--pretty", action="store_true", help="Pretty output with rich")
     args = parser.parse_args(argv)
 
     paths = [Path(p) for p in glob.glob(args.input)]
@@ -246,6 +283,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     output = json.dumps(results, indent=2)
     if args.output:
         Path(args.output).write_text(output)
+        if args.pretty:
+            console.print(f"[green]Results written to {args.output}")
+    elif args.pretty:
+        pretty_print(results)
     else:
         print(output)
 
