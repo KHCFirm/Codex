@@ -1,28 +1,31 @@
 from __future__ import annotations
 
-from flask import Flask, render_template, request, jsonify
+"""Simple Streamlit interface for ``pdf_claim_parser``."""
+
 from pathlib import Path
 import tempfile
 
+import streamlit as st
+
 from pdf_claim_parser import parse_file
 
-app = Flask(__name__)
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+st.title("Claim PDF Parser")
 
-@app.route('/upload', methods=['POST'])
-def upload():
-    files = request.files.getlist('files')
+uploaded_files = st.file_uploader(
+    "Upload claim PDFs", type="pdf", accept_multiple_files=True
+)
+
+if uploaded_files:
     results = []
-    for f in files:
-        if not f:
+    for uploaded in uploaded_files:
+        if not uploaded:
             continue
-        with tempfile.NamedTemporaryFile(delete=True, suffix='.pdf') as tmp:
-            f.save(tmp.name)
+        with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as tmp:
+            tmp.write(uploaded.read())
+            tmp.flush()
             results.append(parse_file(Path(tmp.name)))
-    return jsonify(results)
+    st.json(results)
 
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    st.write("Run this app with: streamlit run web_app.py")
