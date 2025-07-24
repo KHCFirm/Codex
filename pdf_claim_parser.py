@@ -67,28 +67,32 @@ class ServiceLine:
 # ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
-HCFA_KEYWORDS = [
-    "CMS-1500",
-    "HCFA",
-    "24J",
-    "CLAIM FORM",
+HCFA_PATTERNS = [
+    r"CMS[-\s]?1500",
+    r"HCFA[-\s]?1500",
+    r"HCFA",
+    r"HEALTH\s+INSURANCE\s+CLAIM\s+FORM",
+    r"\b24J\b",
 ]
 
-EOB_KEYWORDS = [
-    "EXPLANATION OF BENEFITS",
-    "EOB",
-    "CLAIM SUMMARY",
-    "PATIENT RESPONSIBILITY",
+EOB_PATTERNS = [
+    r"EXPLANATION\s+OF\s+BENEFITS",
+    r"REMITTANCE\s+ADVICE",
+    r"EXPLANATION\s+OF\s+PAYMENT",
+    r"\bEOB\b",
+    r"CLAIM\s+SUMMARY",
+    r"PATIENT\s+RESPONSIBILITY",
 ]
 
 
 def classify_text(text: str) -> Optional[str]:
     """Return ``HCFA`` or ``EOB`` based on keyword presence."""
-    upper = text.upper()
-    if any(k in upper for k in HCFA_KEYWORDS):
-        return "HCFA"
-    if any(k in upper for k in EOB_KEYWORDS):
-        return "EOB"
+    for pattern in HCFA_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return "HCFA"
+    for pattern in EOB_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return "EOB"
     return None
 
 
