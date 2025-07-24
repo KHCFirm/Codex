@@ -3,3 +3,5 @@ pdfplumber
 python-dateutil
 pypdf
 rich
+pytesseract
+pdf2image
