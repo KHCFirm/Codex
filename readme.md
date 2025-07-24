@@ -18,10 +18,10 @@ python pdf_claim_parser.py "path/to/*.pdf" --output results.json
 
 ## Web UI
 
-Run the web application:
+Run the web application with Streamlit:
 
 ```bash
-python web_app.py
+streamlit run web_app.py
 ```
 
-Then open [http://localhost:5000](http://localhost:5000) in your browser. Drag and drop one or more PDF files onto the page and the parsed JSON will appear below the drop area.
+Streamlit will display a local URL in the console. Open it in your browser, upload one or more PDF files and the parsed JSON will appear on the page.
