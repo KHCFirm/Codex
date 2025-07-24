@@ -18,7 +18,17 @@ def test_classify_text_hcfa():
 
 
 def test_classify_text_eob():
-    text = "EXPLANATION OF BENEFITS statement" 
+    text = "EXPLANATION OF BENEFITS statement"
+    assert parser.classify_text(text) == "EOB"
+
+
+def test_classify_text_cms_variant():
+    text = "This document uses the CMS 1500 health insurance claim form"
+    assert parser.classify_text(text) == "HCFA"
+
+
+def test_classify_text_remittance_advice():
+    text = "Please see the remittance advice for payment details"
     assert parser.classify_text(text) == "EOB"
 
 
