@@ -1,6 +1,8 @@
 # Claim Parser
 
-This project parses healthcare claim PDFs (HCFA-1500 claim forms and Explanation of Benefits documents). It now includes a small web interface for uploading PDFs via drag and drop.
+This project extracts key information from healthcare claim PDFs. It supports
+HCFA-1500 claim forms and Explanation of Benefits (EOB) documents and includes a
+Streamlit web application for easy upload and parsing.
 
 ## Setup
 
@@ -13,15 +15,16 @@ pip install -r requirements.txt
 ## Command-line usage
 
 ```bash
-python pdf_claim_parser.py "path/to/*.pdf" --output results.json
+python pdf_claim_parser.py "path/to/*.pdf"
 ```
 
 ## Web UI
 
-Run the web application with Streamlit:
+Launch the Streamlit interface:
 
 ```bash
 streamlit run web_app.py
 ```
 
-Streamlit will display a local URL in the console. Open it in your browser, upload one or more PDF files and the parsed JSON will appear on the page.
+Open the provided URL in your browser, upload one or more PDF files and download
+the parsed results as a JSON file.
