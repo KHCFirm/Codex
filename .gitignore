@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Node
+web/node_modules/
+web/dist/
+
+# Misc
+*.log
