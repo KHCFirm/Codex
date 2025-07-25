@@ -13,12 +13,16 @@ from dataclasses import dataclass, asdict, field
 from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional, Dict
+import logging
 import re
 
 import pdfplumber
 from pdf2image import convert_from_path
 import pytesseract
 from dateutil import parser as dateparser
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +36,7 @@ def parse_money(value: str) -> Optional[Decimal]:
     parentheses for negative amounts.  It returns ``None`` when the value
     cannot be converted.
     """
+    logger.debug("parse_money input=%r", value)
     if not value:
         return None
     cleaned = value.strip()
@@ -41,18 +46,25 @@ def parse_money(value: str) -> Optional[Decimal]:
     cleaned = re.sub(r"[^0-9.-]", "", cleaned)
     try:
         amount = Decimal(cleaned)
-        return -amount if negative else amount
+        result = -amount if negative else amount
+        logger.debug("parse_money result=%s", result)
+        return result
     except Exception:
+        logger.debug("parse_money failed to parse: %r", value)
         return None
 
 
 def parse_date(value: str) -> Optional[str]:
     """Convert various date strings to ISO ``YYYY-MM-DD`` format."""
+    logger.debug("parse_date input=%r", value)
     if not value:
         return None
     try:
-        return dateparser.parse(value, fuzzy=True).date().isoformat()
+        iso = dateparser.parse(value, fuzzy=True).date().isoformat()
+        logger.debug("parse_date result=%s", iso)
+        return iso
     except Exception:
+        logger.debug("parse_date failed to parse: %r", value)
         return None
 
 
@@ -87,12 +99,16 @@ EOB_PATTERNS = [
 
 def classify_text(text: str) -> Optional[str]:
     """Return ``HCFA`` or ``EOB`` based on keyword presence."""
+    logger.debug("classify_text start")
     for pattern in HCFA_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
+            logger.debug("classify_text matched HCFA pattern: %s", pattern)
             return "HCFA"
     for pattern in EOB_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
+            logger.debug("classify_text matched EOB pattern: %s", pattern)
             return "EOB"
+    logger.debug("classify_text no match")
     return None
 
 
@@ -102,21 +118,29 @@ def classify_text(text: str) -> Optional[str]:
 
 def extract_text(pdf_path: Path) -> str:
     """Extract text from a PDF using ``pdfplumber`` with OCR fallback."""
+    logger.debug("extract_text from %s", pdf_path)
     text_parts: List[str] = []
     with pdfplumber.open(str(pdf_path)) as pdf:
-        for page in pdf.pages:
+        for idx, page in enumerate(pdf.pages, start=1):
             page_text = page.extract_text(x_tolerance=1, y_tolerance=1)
+            logger.debug("page %d extracted chars=%d", idx, len(page_text or ""))
             if page_text:
                 text_parts.append(page_text)
     text = "\n".join(text_parts).strip()
     if text:
+        logger.debug("extracted text length=%d", len(text))
         return text
     try:
         images = convert_from_path(str(pdf_path))
-        for img in images:
-            text_parts.append(pytesseract.image_to_string(img))
-        return "\n".join(text_parts)
+        for i, img in enumerate(images, start=1):
+            ocr_text = pytesseract.image_to_string(img)
+            logger.debug("OCR page %d chars=%d", i, len(ocr_text))
+            text_parts.append(ocr_text)
+        text = "\n".join(text_parts)
+        logger.debug("OCR extracted text length=%d", len(text))
+        return text
     except Exception:
+        logger.exception("extract_text failed during OCR")
         return ""
 
 
@@ -138,6 +162,7 @@ class HcfaParser:
     }
 
     def parse(self) -> Dict[str, object]:
+        logger.debug("HcfaParser.parse start")
         self.result = {"doc_type": "HCFA"}
         for field_name, pattern in self.FIELD_PATTERNS.items():
             value = self._find_field(pattern)
@@ -151,7 +176,9 @@ class HcfaParser:
 
     def _find_field(self, pattern: str) -> Optional[str]:
         m = re.search(pattern, self.text, re.IGNORECASE)
-        return m.group(1).strip() if m else None
+        value = m.group(1).strip() if m else None
+        logger.debug("HcfaParser._find_field pattern=%s value=%r", pattern, value)
+        return value
 
     def _parse_service_lines(self) -> List[Dict[str, object]]:
         # Very simple service line parser: look for lines after the 24A header
@@ -169,6 +196,7 @@ class HcfaParser:
                 charge=parse_money(cols[3]),
             )
             lines.append({k: v for k, v in asdict(line).items() if v is not None})
+        logger.debug("HcfaParser parsed %d service lines", len(lines))
         return lines
 
 
@@ -178,6 +206,7 @@ class EobParser:
     result: Dict[str, object] = field(default_factory=dict)
 
     def parse(self) -> Dict[str, object]:
+        logger.debug("EobParser.parse start")
         self.result = {"doc_type": "EOB"}
         date = self._find_field(r"(?:Payment|Check|Printed) Date\s*[:\-]?\s*([^\n]+)")
         if date:
@@ -190,7 +219,9 @@ class EobParser:
 
     def _find_field(self, pattern: str) -> Optional[str]:
         m = re.search(pattern, self.text, re.IGNORECASE)
-        return m.group(1).strip() if m else None
+        value = m.group(1).strip() if m else None
+        logger.debug("EobParser._find_field pattern=%s value=%r", pattern, value)
+        return value
 
     def _parse_service_lines(self) -> List[Dict[str, object]]:
         header = re.search(r"CPT\s+CODE", self.text, re.IGNORECASE)
@@ -208,6 +239,7 @@ class EobParser:
                 insurance_paid=parse_money(cols[3]),
             )
             lines.append({k: v for k, v in asdict(line).items() if v is not None})
+        logger.debug("EobParser parsed %d service lines", len(lines))
         return lines
 
 
@@ -216,8 +248,10 @@ class EobParser:
 # ---------------------------------------------------------------------------
 
 def parse_file(path: Path) -> Dict[str, object]:
+    logger.debug("parse_file path=%s", path)
     text = extract_text(path)
     doc_type = classify_text(text) or "UNKNOWN"
+    logger.debug("parse_file classified as %s", doc_type)
     if doc_type == "HCFA":
         parser = HcfaParser(text)
         result = parser.parse()
@@ -227,6 +261,7 @@ def parse_file(path: Path) -> Dict[str, object]:
     else:
         result = {"doc_type": doc_type}
     result["source_file"] = path.name
+    logger.debug("parse_file result keys=%s", list(result.keys()))
     return result
 
 

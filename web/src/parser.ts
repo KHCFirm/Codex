@@ -45,34 +45,55 @@ const EOB_PATTERNS = [
 ];
 
 function classifyText(text: string): string {
-  for (const p of HCFA_PATTERNS) if (p.test(text)) return 'HCFA';
-  for (const p of EOB_PATTERNS) if (p.test(text)) return 'EOB';
+  console.debug('classifyText start');
+  for (const p of HCFA_PATTERNS) {
+    if (p.test(text)) {
+      console.debug('matched HCFA pattern', p);
+      return 'HCFA';
+    }
+  }
+  for (const p of EOB_PATTERNS) {
+    if (p.test(text)) {
+      console.debug('matched EOB pattern', p);
+      return 'EOB';
+    }
+  }
+  console.debug('classifyText no match');
   return 'UNKNOWN';
 }
 
 function parseMoney(value?: string): number | undefined {
+  console.debug('parseMoney input', value);
   if (!value) return undefined;
   const cleaned = value.replace(/[^0-9.-]/g, '');
   const n = parseFloat(cleaned);
-  return isNaN(n) ? undefined : n;
+  const out = isNaN(n) ? undefined : n;
+  console.debug('parseMoney result', out);
+  return out;
 }
 
 function parseDate(value?: string): string | undefined {
+  console.debug('parseDate input', value);
   if (!value) return undefined;
   const d = new Date(value);
-  return isNaN(d.getTime()) ? undefined : d.toISOString().slice(0, 10);
+  const out = isNaN(d.getTime()) ? undefined : d.toISOString().slice(0, 10);
+  console.debug('parseDate result', out);
+  return out;
 }
 
 export async function extractText(file: File): Promise<string> {
+  console.debug('extractText start', file.name);
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await getDocument({ data: arrayBuffer }).promise;
   let text = '';
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    const strings = content.items.map((item: any) => (item.str as string));
+    const strings = content.items.map((item: any) => item.str as string);
+    console.debug('extractText page', i, 'items', strings.length);
     text += strings.join(' ') + '\n';
   }
+  console.debug('extractText length', text.length);
   return text;
 }
 
@@ -82,6 +103,7 @@ function find(pattern: RegExp, text: string): string | undefined {
 }
 
 function parseHcfa(text: string): Partial<ParseResult> {
+  console.debug('parseHcfa start');
   const result: Partial<ParseResult> = { doc_type: 'HCFA' };
   const fields: Record<string, RegExp> = {
     patient_name: /PATIENT'S NAME[^\n]*\n(.+)/i,
@@ -92,11 +114,15 @@ function parseHcfa(text: string): Partial<ParseResult> {
   };
   for (const [k, p] of Object.entries(fields)) {
     const val = find(p, text);
-    if (val) (result as any)[k] = val;
+    if (val) {
+      console.debug('parseHcfa field', k, val);
+      (result as any)[k] = val;
+    }
   }
   const dob = find(/3\.\s*DATE OF BIRTH[^\n]*\n(.+)/i, text);
   if (dob) result.patient_dob = parseDate(dob);
   result.service_lines = parseServiceLinesHcfa(text);
+  console.debug('parseHcfa service lines', result.service_lines.length);
   return result;
 }
 
@@ -113,16 +139,25 @@ function parseServiceLinesHcfa(text: string): ServiceLine[] {
       charge: parseMoney(cols[3]),
     });
   }
+  console.debug('parseServiceLinesHcfa lines', lines.length);
   return lines;
 }
 
 function parseEob(text: string): Partial<ParseResult> {
+  console.debug('parseEob start');
   const result: Partial<ParseResult> = { doc_type: 'EOB' };
   const date = find(/(?:Payment|Check|Printed) Date\s*[:\-]?\s*([^\n]+)/i, text);
-  if (date) result.eob_date = parseDate(date);
+  if (date) {
+    result.eob_date = parseDate(date);
+    console.debug('parseEob date', result.eob_date);
+  }
   const claim = find(/CLAIM NUMBER[:\s]*([A-Z0-9-]+)/i, text);
-  if (claim) result.claim_number = claim;
+  if (claim) {
+    result.claim_number = claim;
+    console.debug('parseEob claim', claim);
+  }
   result.service_lines = parseServiceLinesEob(text);
+  console.debug('parseEob service lines', result.service_lines.length);
   return result;
 }
 
@@ -141,14 +176,19 @@ function parseServiceLinesEob(text: string): ServiceLine[] {
       insurance_paid: parseMoney(cols[3]),
     });
   }
+  console.debug('parseServiceLinesEob lines', lines.length);
   return lines;
 }
 
 export async function parseFile(file: File): Promise<ParseResult> {
+  console.debug('parseFile start', file.name);
   const text = await extractText(file);
   const docType = classifyText(text);
+  console.debug('parseFile docType', docType);
   let result: Partial<ParseResult> = { doc_type: docType };
   if (docType === 'HCFA') result = { ...result, ...parseHcfa(text) };
   else if (docType === 'EOB') result = { ...result, ...parseEob(text) };
-  return { ...(result as ParseResult), source_file: file.name };
+  const final = { ...(result as ParseResult), source_file: file.name };
+  console.debug('parseFile result keys', Object.keys(final));
+  return final;
 }
