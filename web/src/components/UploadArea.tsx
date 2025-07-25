@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react'
-import { parseFile, ParseResult } from '../parser'
+import { parseFile } from '../parser'
+import type { ParseResult } from '../parser'
 
 export default function UploadArea() {
   const inputRef = useRef<HTMLInputElement>(null)
