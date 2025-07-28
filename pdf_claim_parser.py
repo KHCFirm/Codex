@@ -177,20 +177,53 @@ class EobParser:
     text: str
     result: Dict[str, object] = field(default_factory=dict)
 
+    DATE_PATTERNS = [
+        r"(?:statement|payment|check|printed|processing)\s*date\s*(?:on)?\s*[:\-]?\s*([^\n]+)",
+        r"date\s*[:\-]?\s*([^\n]+)"
+    ]
+
     def parse(self) -> Dict[str, object]:
         self.result = {"doc_type": "EOB"}
-        date = self._find_field(r"(?:Payment|Check|Printed) Date\s*[:\-]?\s*([^\n]+)")
+
+        date = self._extract_date()
         if date:
             self.result["eob_date"] = parse_date(date)
+
         claim = self._find_field(r"CLAIM NUMBER[:\s]*([A-Z0-9-]+)")
         if claim:
             self.result["claim_number"] = claim
-        self.result["service_lines"] = self._parse_service_lines()
+
+        self.result["insurance_name"] = self._extract_insurance_name()
+
+        service_lines = self._parse_service_lines()
+        self.result["service_lines"] = service_lines
+
+        if service_lines:
+            cpt_codes = [l.get("cpt_code") for l in service_lines if l.get("cpt_code")]
+            self.result["cpt_codes"] = sorted(set(cpt_codes))
+            pr_total = sum((l.get("patient_responsibility") or Decimal(0) for l in service_lines), Decimal(0))
+            ip_total = sum((l.get("insurance_paid") or Decimal(0) for l in service_lines), Decimal(0))
+            self.result["patient_responsibility"] = pr_total
+            self.result["insurance_paid"] = ip_total
+
         return self.result
 
     def _find_field(self, pattern: str) -> Optional[str]:
         m = re.search(pattern, self.text, re.IGNORECASE)
         return m.group(1).strip() if m else None
+
+    def _extract_date(self) -> Optional[str]:
+        for pattern in self.DATE_PATTERNS:
+            date = self._find_field(pattern)
+            if date:
+                return date
+        return None
+
+    def _extract_insurance_name(self) -> Optional[str]:
+        for line in self.text.splitlines()[:10]:
+            if "insurance" in line.lower():
+                return line.strip()
+        return None
 
     def _parse_service_lines(self) -> List[Dict[str, object]]:
         header = re.search(r"CPT\s+CODE", self.text, re.IGNORECASE)
