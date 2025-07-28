@@ -34,3 +34,20 @@ def test_classify_text_remittance_advice():
 
 def test_parse_money():
     assert parser.parse_money("$1,234.56") == Decimal("1234.56")
+
+
+def test_eob_parser_fields():
+    text = (
+        "Sample Insurance Company\n"
+        "Statement Date: 02/05/2024\n"
+        "CLAIM NUMBER ABC123\n"
+        "CPT CODE\n"
+        "99213 100.00 20.00 80.00\n"
+    )
+    p = parser.EobParser(text)
+    result = p.parse()
+    assert result["eob_date"] == "2024-02-05"
+    assert result["insurance_name"] == "Sample Insurance Company"
+    assert result["patient_responsibility"] == Decimal("20.00")
+    assert result["insurance_paid"] == Decimal("80.00")
+    assert result["cpt_codes"] == ["99213"]
