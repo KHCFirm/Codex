@@ -5,18 +5,19 @@ import PDFDocument from 'pdfkit';
  *  - FILEVINE_CLIENT_ID
  *  - FILEVINE_CLIENT_SECRET
  *  - FILEVINE_PAT_TOKEN
- *  - FILEVINE_HOST   (optional, default: https://khcfirm.filevineapp.com)
  *  - DEBUG           (optional: "true" | "false"; default: "true")
  *
  * Notes:
- * - US ONLY per your instruction (no Canada branch). All project resources use /fv-app/v2-us.
- * - Utils endpoint (GetUserOrgsWithToken) uses the non-regional base /fv-app/v2.
+ * - US ONLY (no Canada). Project resources use /fv-app/v2-us on the GLOBAL API host.
+ * - Utils endpoint (GetUserOrgsWithToken) must use the GLOBAL host /fv-app/v2 (not the tenant subdomain).
  */
 
 const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
-const FILEVINE_HOST = (process.env.FILEVINE_HOST || 'https://khcfirm.filevineapp.com').replace(/\/+$/, '');
-const GATEWAY_UTILS_BASE = `${FILEVINE_HOST}/fv-app/v2`;     // non-regional
-const GATEWAY_REGION_BASE = `${FILEVINE_HOST}/fv-app/v2-us`; // US regional
+
+// GLOBAL API hosts (required for stable routing)
+const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2';     // non-regional (utils)
+const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2-us';  // US regional (projects)
+
 const DEBUG = (process.env.DEBUG ?? 'true').toLowerCase() !== 'false';
 
 const REQ = () => Math.random().toString(36).slice(2, 10);
@@ -33,7 +34,6 @@ export default async function handler(req, res) {
     }
 
     dlog(`[${reqId}] Start`, {
-      host: FILEVINE_HOST,
       utilsBase: GATEWAY_UTILS_BASE,
       regionBase: GATEWAY_REGION_BASE,
       projectId
@@ -42,10 +42,10 @@ export default async function handler(req, res) {
     // 1) Exchange PAT for bearer token
     const token = await getBearerToken(reqId);
 
-    // 2) Resolve User ID and Org ID (non-regional utils base)
+    // 2) Resolve User ID and Org ID (non-regional utils base on GLOBAL host)
     const { userId, orgId } = await getUserAndOrgIds(token, reqId);
 
-    // 3) Pull notes + emails from regional base (with pagination)
+    // 3) Pull notes + emails from regional base (GLOBAL host) with pagination
     const [notes, emails] = await Promise.all([
       pullAllPages(`${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/notes`, token, userId, orgId, reqId, 'notes'),
       pullAllPages(`${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/emails`, token, userId, orgId, reqId, 'emails')
@@ -160,7 +160,10 @@ async function getBearerToken(reqId) {
     body
   });
   dlog(`[${reqId}] Identity response`, { status: resp.status });
-  if (!resp.ok) throw new Error(`Identity token error: ${resp.status}`);
+  if (!resp.ok) {
+    await logErrorBody(resp, reqId, 'identity');
+    throw new Error(`Identity token error: ${resp.status}`);
+  }
   const data = await safeJson(resp, reqId, 'identity');
   if (!data.access_token) throw new Error('No access_token in identity response');
   dlog(`[${reqId}] Token acquired (length)`, { accessTokenLength: String(data.access_token).length });
@@ -169,13 +172,16 @@ async function getBearerToken(reqId) {
 
 async function getUserAndOrgIds(bearer, reqId) {
   const url = `${GATEWAY_UTILS_BASE}/utils/GetUserOrgsWithToken`;
-  dlog(`[${reqId}] POST ${url} (utils, non-regional)`);
+  dlog(`[${reqId}] POST ${url} (utils, non-regional, GLOBAL host)`);
   const resp = await fetchWithRetry(url, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${bearer}`, 'Accept': 'application/json' }
   }, reqId);
   dlog(`[${reqId}] GetUserOrgsWithToken response`, { status: resp.status });
-  if (!resp.ok) throw new Error(`GetUserOrgsWithToken error: ${resp.status}`);
+  if (!resp.ok) {
+    await logErrorBody(resp, reqId, 'GetUserOrgsWithToken');
+    throw new Error(`GetUserOrgsWithToken error: ${resp.status}`);
+  }
 
   const data = await safeJson(resp, reqId, 'getUserOrgsWithToken');
   const userId = data?.userId || data?.user?.id || data?.user?.userId;
@@ -207,7 +213,10 @@ async function pullAllPages(baseUrl, bearer, userId, orgId, reqId, label) {
     }, reqId);
     dlog(`[${reqId}] ${label} page response`, { status: resp.status, offset });
 
-    if (!resp.ok) throw new Error(`${url.pathname} error: ${resp.status}`);
+    if (!resp.ok) {
+      await logErrorBody(resp, reqId, `${label}-page`);
+      throw new Error(`${url.pathname} error: ${resp.status}`);
+    }
 
     const data = await safeJson(resp, reqId, `${label}-page`);
     const items = data?.items || data?.data || data?.results || [];
@@ -263,6 +272,16 @@ async function safeJson(resp, reqId, tag) {
   } catch (err) {
     dlog(`[${reqId}] ${tag} body read error`, { message: err?.message });
     return {};
+  }
+}
+
+async function logErrorBody(resp, reqId, tag) {
+  try {
+    const clone = resp.clone?.() ?? resp;
+    const text = await clone.text();
+    dlog(`[${reqId}] ${tag} error body`, { snippet: text.slice(0, 600) });
+  } catch (err) {
+    dlog(`[${reqId}] ${tag} error body read failed`, { message: err?.message });
   }
 }
 
