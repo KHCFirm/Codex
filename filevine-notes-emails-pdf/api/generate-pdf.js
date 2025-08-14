@@ -12,7 +12,7 @@ import PDFDocument from 'pdfkit';
 
 const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
 const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2';     // non-regional
-const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2-us';  // US regional
+const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2';  // US regional
 const DEBUG = (process.env.DEBUG ?? 'true').toLowerCase() !== 'false';
 
 const REQ = () => Math.random().toString(36).slice(2, 10);
