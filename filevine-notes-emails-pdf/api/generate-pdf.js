@@ -11,8 +11,8 @@ import PDFDocument from 'pdfkit';
  */
 
 const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
-const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2';     // non-regional
-const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2';     // Changed from v2-us to v2
+const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2';     // non-regional utils
+const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2-us';  // **US regional base** (fix 404s)
 const DEBUG = (process.env.DEBUG ?? 'true').toLowerCase() !== 'false';
 
 const REQ = () => Math.random().toString(36).slice(2, 10);
@@ -61,9 +61,7 @@ export default async function handler(req, res) {
     // 4) Normalize + merge chronologically
     const merged = [
       ...notes.map((n, index) => {
-        // Debug the first note
         if (index === 0) debugDateFields([n], 'Note', reqId);
-
         return {
           type: 'Note',
           id: normalizeId(n?.id ?? n?.noteId),
@@ -75,9 +73,7 @@ export default async function handler(req, res) {
         };
       }),
       ...emails.map((e, index) => {
-        // Debug the first email
         if (index === 0) debugDateFields([e], 'Email', reqId);
-
         return {
           type: 'Email',
           id: normalizeId(e?.id ?? e?.emailId),
@@ -109,10 +105,10 @@ export default async function handler(req, res) {
     } else {
       for (const item of merged) {
         doc.moveDown();
-        doc
-          .fontSize(12)
-          .fillColor('#000')
-          .text(`${item.type} • ${fmt(item.created)}${item.author ? ` • ${item.author}` : ''}`);
+        const headerBits = [item.type, fmt(item.created)];
+        if (item.author) headerBits.push(String(item.author));
+        doc.fontSize(12).fillColor('#000').text(headerBits.join(' • '));
+
         if (item.title) {
           doc.font('Helvetica-Bold').text(item.title);
           doc.font('Helvetica');
@@ -126,8 +122,8 @@ export default async function handler(req, res) {
           doc.moveDown(0.25);
           doc.fontSize(11).fillColor('#000').text(`Comments (${item.comments.length}):`);
           for (const c of item.comments) {
-            const header = `— ${fmt(c.created)}${c.author ? ` • ${c.author}` : ''}`;
-            doc.fontSize(10).fillColor('#333').text(header, { indent: 16 });
+            const head = `— ${fmt(c.created)}${c.author ? ` • ${c.author}` : ''}`;
+            doc.fontSize(10).fillColor('#333').text(head, { indent: 16 });
             if (c.body) {
               doc.fontSize(10).fillColor('#111').text(stripHtml(c.body), { indent: 32 });
             }
@@ -165,20 +161,64 @@ function normalizeId(v) {
   return String(v);
 }
 
+function firstString(...vals) {
+  for (const v of vals) {
+    if (!v && v !== 0) continue;
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return '';
+}
+
+function composeName(obj) {
+  if (!obj || typeof obj !== 'object') return '';
+  const fn = firstString(obj.firstName, obj.givenName);
+  const ln = firstString(obj.lastName, obj.surname);
+  const disp = firstString(obj.displayName, obj.fullName, obj.name);
+  if (fn || ln) return `${fn} ${ln}`.trim();
+  return disp;
+}
+
 function extractAuthor(obj) {
-  return (
-    obj?.createdBy?.name ||
-    obj?.author?.name ||
-    obj?.user?.name ||
-    obj?.from?.name ||
-    obj?.sender?.name ||
-    obj?.createdBy ||
-    obj?.author ||
-    obj?.user ||
-    obj?.from ||
-    obj?.sender ||
-    ''
+  // Try common shapes first
+  const direct = firstString(
+    obj?.createdBy?.name,
+    obj?.author?.name,
+    obj?.user?.name,
+    obj?.from?.name,
+    obj?.sender?.name,
+    obj?.createdByName,
+    obj?.authorName,
+    obj?.creatorName,
+    obj?.createdByFullName,
+    obj?.ownerName,
+    obj?.createdBy,
+    obj?.author,
+    obj?.user,
+    obj?.from,
+    obj?.sender
   );
+  if (direct) return direct;
+
+  // Compose from sub-objects if present
+  const composed = firstString(
+    composeName(obj?.createdBy),
+    composeName(obj?.author),
+    composeName(obj?.user),
+    composeName(obj?.from),
+    composeName(obj?.sender),
+    composeName(obj?.owner),
+    composeName(obj?.creator)
+  );
+  if (composed) return composed;
+
+  // E-mail fallback (e.g., { from: { email } })
+  const emailish = firstString(
+    obj?.from?.email,
+    obj?.sender?.email,
+    obj?.createdBy?.email,
+    obj?.author?.email
+  );
+  return emailish;
 }
 
 function debugDateFields(items, type, reqId) {
@@ -198,65 +238,50 @@ function debugDateFields(items, type, reqId) {
         acc[field] = sample[field];
         return acc;
       }, {}),
-      allFields: Object.keys(sample).slice(0, 10) // Limit to first 10 fields to avoid spam
+      allFields: Object.keys(sample).slice(0, 10)
     });
   }
 }
 
 function extractDate(item, type) {
-  // Common date field names to try
   const dateFields =
     type === 'note'
       ? [
-          'createdDate', 'created', 'date', 'dateCreated', 'createDate',
-          'timestamp', 'createdAt', 'dateTime', 'noteDate', 'updatedDate'
+          'createdDate','created','date','dateCreated','createDate',
+          'timestamp','createdAt','dateTime','noteDate','updatedDate'
         ]
       : type === 'email'
       ? [
-          'dateReceived', 'dateSent', 'createdDate', 'created', 'date',
-          'dateCreated', 'createDate', 'timestamp', 'createdAt', 'dateTime',
-          'receivedDate', 'sentDate', 'emailDate', 'updatedDate'
+          'dateReceived','dateSent','createdDate','created','date',
+          'dateCreated','createDate','timestamp','createdAt','dateTime',
+          'receivedDate','sentDate','emailDate','updatedDate'
         ]
       : [
-          // comment or fallback
-          'createdDate', 'created', 'date', 'dateCreated', 'createDate',
-          'timestamp', 'createdAt', 'dateTime', 'commentDate', 'updatedDate'
+          'createdDate','created','date','dateCreated','createDate',
+          'timestamp','createdAt','dateTime','commentDate','updatedDate'
         ];
 
   for (const field of dateFields) {
     const value = item?.[field];
     if (value) {
       const parsed = new Date(value);
-      if (!isNaN(parsed.getTime())) {
-        return value; // Return original value if it parses correctly
-      }
+      if (!isNaN(parsed.getTime())) return value;
     }
   }
-
-  // If no valid date found, return current timestamp as fallback
   console.warn(`No valid date found for ${type}:`, Object.keys(item || {}));
   return new Date().toISOString();
 }
 
 function fmt(d) {
   if (!d) return 'No Date';
-
   try {
     const date = new Date(d);
-    if (isNaN(date.getTime())) {
-      console.warn('Invalid date value:', d);
-      return 'Invalid Date';
-    }
+    if (isNaN(date.getTime())) return 'Invalid Date';
     return date.toLocaleString('en-US', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false
     });
-  } catch (err) {
-    console.warn('Date formatting error:', err.message, 'for value:', d);
+  } catch {
     return 'Date Error';
   }
 }
@@ -365,20 +390,20 @@ async function pullWithStrategies(kind, projectId, bearer, userId, orgId, reqId)
 
   const strategies = kind === 'notes'
     ? [
-        { label: 'GET notes',              method: 'GET',  url: `${base}/notes` },
-        { label: 'GET activity/notes',     method: 'GET',  url: `${base}/activity/notes` },
-        { label: 'GET activity?types=note',method: 'GET',  url: `${base}/activity`, qp: { types: 'note' } },
-        { label: 'GET notes/list',         method: 'GET',  url: `${base}/notes/list` },
-        { label: 'POST notes',             method: 'POST', url: `${base}/notes`,      body: ({offset, limit}) => ({ offset, limit }) },
-        { label: 'POST notes/list',        method: 'POST', url: `${base}/notes/list`, body: ({offset, limit}) => ({ offset, limit }) },
+        { label: 'GET notes',               method: 'GET',  url: `${base}/notes` },
+        { label: 'GET activity/notes',      method: 'GET',  url: `${base}/activity/notes` },
+        { label: 'GET activity?types=note', method: 'GET',  url: `${base}/activity`, qp: { types: 'note' } },
+        { label: 'GET notes/list',          method: 'GET',  url: `${base}/notes/list` },
+        { label: 'POST notes',              method: 'POST', url: `${base}/notes`,      body: ({offset, limit}) => ({ offset, limit }) },
+        { label: 'POST notes/list',         method: 'POST', url: `${base}/notes/list`, body: ({offset, limit}) => ({ offset, limit }) },
       ]
     : [
-        { label: 'GET emails',              method: 'GET',  url: `${base}/emails` },
-        { label: 'GET activity/emails',     method: 'GET',  url: `${base}/activity/emails` },
-        { label: 'GET activity?types=email',method: 'GET',  url: `${base}/activity`, qp: { types: 'email' } },
-        { label: 'GET emails/list',         method: 'GET',  url: `${base}/emails/list` },
-        { label: 'POST emails',             method: 'POST', url: `${base}/emails`,      body: ({offset, limit}) => ({ offset, limit }) },
-        { label: 'POST emails/list',        method: 'POST', url: `${base}/emails/list`, body: ({offset, limit}) => ({ offset, limit }) },
+        { label: 'GET emails',               method: 'GET',  url: `${base}/emails` },
+        { label: 'GET activity/emails',      method: 'GET',  url: `${base}/activity/emails` },
+        { label: 'GET activity?types=email', method: 'GET',  url: `${base}/activity`, qp: { types: 'email' } },
+        { label: 'GET emails/list',          method: 'GET',  url: `${base}/emails/list` },
+        { label: 'POST emails',              method: 'POST', url: `${base}/emails`,      body: ({offset, limit}) => ({ offset, limit }) },
+        { label: 'POST emails/list',         method: 'POST', url: `${base}/emails/list`, body: ({offset, limit}) => ({ offset, limit }) },
       ];
 
   for (const strat of strategies) {
@@ -571,6 +596,15 @@ function commentsLinkFromNote(note) {
   );
 }
 
+function absolutizeCommentsUrl(explicitUrl, projectBase) {
+  if (!explicitUrl) return null;
+  if (/^https?:\/\//i.test(explicitUrl)) return explicitUrl; // already absolute
+  // Handle "/notes/{id}/comments" forms (relative to project base)
+  if (explicitUrl.startsWith('/')) return `${projectBase}${explicitUrl}`;
+  // Handle "notes/{id}/comments" (no leading slash)
+  return `${projectBase}/${explicitUrl}`;
+}
+
 async function attachCommentsToNotes({ notes, projectId, token, userId, orgId, reqId }) {
   if (!Array.isArray(notes) || !notes.length) return [];
 
@@ -596,11 +630,10 @@ async function attachCommentsToNotes({ notes, projectId, token, userId, orgId, r
               dlog(`[${reqId}] No usable noteId; skipping comment fetch`);
               results.push({ ...note, comments: [] });
             } else {
-              const link = commentsLinkFromNote(note);
               const comments = await getNoteComments({
                 projectId,
                 noteId,
-                explicitUrl: link,
+                explicitUrl: commentsLinkFromNote(note),
                 bearer: token,
                 userId,
                 orgId,
@@ -623,40 +656,41 @@ async function attachCommentsToNotes({ notes, projectId, token, userId, orgId, r
 }
 
 async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId, orgId, reqId }) {
-  const base = `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}`;
+  const projectBase = `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}`;
   const nid  = encodeURIComponent(String(noteId));
   const limit = 50;
 
-  // Try explicit per-item link first
+  // Try explicit per-item link first (make absolute if needed)
   if (explicitUrl) {
+    const abs = absolutizeCommentsUrl(explicitUrl, projectBase);
     try {
       const items = await pullAllPagesWithOneRoute(
-        { label: 'GET link:comments', method: 'GET', url: explicitUrl },
+        { label: 'GET link:comments', method: 'GET', url: abs },
         bearer, userId, orgId, limit, reqId, `comments[note:${noteId}]`
       );
       if (Array.isArray(items) && items.length) return normalizeComments(items);
     } catch (e) {
-      dlog(`[${reqId}] comments explicit link failed`, { url: explicitUrl, error: e?.message });
+      dlog(`[${reqId}] comments explicit link failed`, { url: explicitUrl, abs, error: e?.message });
     }
   }
 
   const strategies = [
-    { label: 'GET notes/{id}/comments',  method: 'GET',  url: `${base}/notes/${nid}/comments` },
-    { label: 'GET notes/{id}/replies',   method: 'GET',  url: `${base}/notes/${nid}/replies` },
-    { label: 'POST notes/{id}/comments', method: 'POST', url: `${base}/notes/${nid}/comments`,
+    { label: 'GET notes/{id}/comments',  method: 'GET',  url: `${projectBase}/notes/${nid}/comments` },
+    { label: 'GET notes/{id}/replies',   method: 'GET',  url: `${projectBase}/notes/${nid}/replies` },
+    { label: 'POST notes/{id}/comments', method: 'POST', url: `${projectBase}/notes/${nid}/comments`,
       body: ({offset, limit}) => ({ offset, limit }) },
 
     // collection-level comments endpoints
-    { label: 'GET comments',             method: 'GET',  url: `${base}/comments`, qp: { parentType: 'note', parentId: String(noteId) } },
-    { label: 'GET comments/list',        method: 'GET',  url: `${base}/comments/list`, qp: { parentType: 'note', parentId: String(noteId), limit, offset: 0 } },
-    { label: 'POST comments',            method: 'POST', url: `${base}/comments`,
+    { label: 'GET comments',             method: 'GET',  url: `${projectBase}/comments`, qp: { parentType: 'note', parentId: String(noteId) } },
+    { label: 'GET comments/list',        method: 'GET',  url: `${projectBase}/comments/list`, qp: { parentType: 'note', parentId: String(noteId), limit, offset: 0 } },
+    { label: 'POST comments',            method: 'POST', url: `${projectBase}/comments`,
       body: ({offset, limit}) => ({ parentType: 'note', parentId: String(noteId), offset, limit }) },
-    { label: 'POST comments/list',       method: 'POST', url: `${base}/comments/list`,
+    { label: 'POST comments/list',       method: 'POST', url: `${projectBase}/comments/list`,
       body: ({offset, limit}) => ({ parentType: 'note', parentId: String(noteId), offset, limit }) },
 
     // activity fallback
     { label: 'GET activity?types=comment', method: 'GET',
-      url: `${base}/activity`, qp: { types: 'comment', parentType: 'note', parentId: String(noteId) } },
+      url: `${projectBase}/activity`, qp: { types: 'comment', parentType: 'note', parentId: String(noteId) } },
   ];
 
   for (const strat of strategies) {
