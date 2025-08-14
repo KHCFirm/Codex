@@ -5,10 +5,16 @@ import PDFDocument from 'pdfkit';
  *  - FILEVINE_CLIENT_ID
  *  - FILEVINE_CLIENT_SECRET
  *  - FILEVINE_PAT_TOKEN
+ *  - FILEVINE_REGION  (optional: "us" | "ca"; default "us")
  */
 const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
-// Use v2-us for US tenants; switch to v2-ca if your tenant is in Canada.
-const GATEWAY_BASE = 'https://api.filevineapp.com/fv-app/v2-us';
+
+// IMPORTANT:
+// - Utils (GetUserOrgsWithToken) is on the *non-regional* base: /fv-app/v2
+// - Project resources (notes/emails) are on the *regional* base: /fv-app/v2-us or /fv-app/v2-ca
+const GATEWAY_UTILS_BASE = 'https://api.filevineapp.com/fv-app/v2';
+const REGION = (process.env.FILEVINE_REGION || 'us').toLowerCase() === 'ca' ? 'ca' : 'us';
+const GATEWAY_REGION_BASE = `https://api.filevineapp.com/fv-app/v2-${REGION}`;
 
 export default async function handler(req, res) {
   try {
@@ -19,16 +25,16 @@ export default async function handler(req, res) {
       return res.end('Missing projectId');
     }
 
-    // 1) Get bearer token via PAT + client credentials
+    // 1) Exchange PAT for bearer token
     const token = await getBearerToken();
 
-    // 2) Resolve User ID and Org ID for gateway headers
+    // 2) Resolve User ID and Org ID (non-regional utils base)
     const { userId, orgId } = await getUserAndOrgIds(token);
 
-    // 3) Pull notes + emails with pagination
+    // 3) Pull notes + emails from regional base (with pagination)
     const [notes, emails] = await Promise.all([
-      pullAllPages(`${GATEWAY_BASE}/projects/${encodeURIComponent(projectId)}/notes`, token, userId, orgId),
-      pullAllPages(`${GATEWAY_BASE}/projects/${encodeURIComponent(projectId)}/emails`, token, userId, orgId)
+      pullAllPages(`${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/notes`, token, userId, orgId),
+      pullAllPages(`${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/emails`, token, userId, orgId)
     ]);
 
     // 4) Normalize + merge chronologically
@@ -70,8 +76,7 @@ export default async function handler(req, res) {
       for (const item of merged) {
         doc.moveDown();
         doc.fontSize(12).fillColor('#000').text(
-          `${item.type} • ${fmt(item.created)}${item.author ? ` • ${item.author}` : ''}`,
-          { continued: false }
+          `${item.type} • ${fmt(item.created)}${item.author ? ` • ${item.author}` : ''}`
         );
         if (item.title) {
           doc.font('Helvetica-Bold').text(item.title);
@@ -79,9 +84,7 @@ export default async function handler(req, res) {
         }
         if (item.body) doc.fontSize(11).fillColor('#111').text(stripHtml(item.body), { align: 'left' });
         doc.moveDown(0.25);
-        doc
-          .strokeColor('#ddd')
-          .lineWidth(1)
+        doc.strokeColor('#ddd').lineWidth(1)
           .moveTo(doc.page.margins.left, doc.y)
           .lineTo(doc.page.width - doc.page.margins.right, doc.y)
           .stroke();
@@ -135,7 +138,8 @@ async function getBearerToken() {
 }
 
 async function getUserAndOrgIds(bearer) {
-  const resp = await fetchWithRetry(`${GATEWAY_BASE}/utils/GetUserOrgsWithToken`, {
+  // NON-REGIONAL base per Filevine docs
+  const resp = await fetchWithRetry(`${GATEWAY_UTILS_BASE}/utils/GetUserOrgsWithToken`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${bearer}`,
@@ -145,7 +149,6 @@ async function getUserAndOrgIds(bearer) {
   if (!resp.ok) throw new Error(`GetUserOrgsWithToken error: ${resp.status}`);
   const data = await resp.json();
 
-  // Prefer current user and primary org if present
   let userId = data?.userId || data?.user?.id || data?.user?.userId;
   let orgId = data?.orgId || data?.org?.id || data?.orgs?.[0]?.orgId || data?.orgs?.[0]?.id;
   if (!userId || !orgId) throw new Error('Could not resolve userId/orgId from gateway response');
@@ -183,20 +186,14 @@ async function pullAllPages(baseUrl, bearer, userId, orgId) {
   return out;
 }
 
-/**
- * Minimal retry for transient 5xx responses.
- */
+/** Minimal retry for transient 5xx responses. */
 async function fetchWithRetry(input, init = {}, retries = 2, delayMs = 250) {
   let attempt = 0;
   while (true) {
     const resp = await fetch(input, init);
     if (resp.status < 500 || retries === 0) return resp;
     attempt++;
-    await sleep(delayMs * attempt); // backoff
+    await new Promise(r => setTimeout(r, delayMs * attempt));
     retries--;
   }
-}
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
 }
