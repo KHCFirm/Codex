@@ -11,8 +11,8 @@ import PDFDocument from 'pdfkit';
  */
 
 const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
-const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2';     // non-regional
-const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2';     // Changed from v2-us to v2
+const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2'; // non-regional
+const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2'; // using v2 per your working config
 const DEBUG = (process.env.DEBUG ?? 'true').toLowerCase() !== 'false';
 
 const REQ = () => Math.random().toString(36).slice(2, 10);
@@ -42,31 +42,43 @@ export default async function handler(req, res) {
     dlog(`[${reqId}] Using gateway headers`, { 'x-fv-userid': userId, 'x-fv-orgid': orgId });
 
     // 3) Pull notes & emails (multi-strategy to be resilient)
-    const [notes, emails] = await Promise.all([
+    const [rawNotes, emails] = await Promise.all([
       pullWithStrategies('notes', projectId, token, userId, orgId, reqId),
       pullWithStrategies('emails', projectId, token, userId, orgId, reqId)
     ]);
-    dlog(`[${reqId}] Fetch complete`, { notesCount: notes.length, emailsCount: emails.length });
+    dlog(`[${reqId}] Fetch complete`, { notesCount: rawNotes.length, emailsCount: emails.length });
+
+    // 3b) For each note, fetch its comments (author + body + date)
+    const notes = await attachCommentsToNotes({
+      notes: rawNotes,
+      projectId,
+      token,
+      userId,
+      orgId,
+      reqId
+    });
 
     // 4) Normalize + merge chronologically
     const merged = [
       ...notes.map((n, index) => {
-        // Debug the first note
         if (index === 0) debugDateFields([n], 'Note', reqId);
-        
         return {
           type: 'Note',
           id: n?.id ?? n?.noteId,
           created: extractDate(n, 'note'),
-          author: n?.createdBy?.name || n?.author?.name || n?.user?.name || n?.createdBy,
+          author: extractAuthor(n),
           title: n?.title || n?.subject || '',
-          body: n?.body || n?.text || n?.content || ''
+          body: n?.body || n?.text || n?.content || '',
+          comments: Array.isArray(n?.comments) ? n.comments.map(c => ({
+            id: c?.id ?? c?.commentId,
+            created: extractDate(c, 'comment'),
+            author: extractAuthor(c),
+            body: c?.body || c?.text || c?.content || ''
+          })) : []
         };
       }),
       ...emails.map((e, index) => {
-        // Debug the first email
         if (index === 0) debugDateFields([e], 'Email', reqId);
-        
         return {
           type: 'Email',
           id: e?.id ?? e?.emailId,
@@ -106,7 +118,25 @@ export default async function handler(req, res) {
           doc.font('Helvetica-Bold').text(item.title);
           doc.font('Helvetica');
         }
-        if (item.body) doc.fontSize(11).fillColor('#111').text(stripHtml(item.body), { align: 'left' });
+        if (item.body) {
+          doc.fontSize(11).fillColor('#111').text(stripHtml(item.body), { align: 'left' });
+        }
+
+        // Render comments if this is a Note
+        if (item.type === 'Note' && Array.isArray(item.comments) && item.comments.length) {
+          doc.moveDown(0.3);
+          doc.fontSize(11).fillColor('#000').text('Comments:');
+          for (const c of item.comments) {
+            doc.moveDown(0.1);
+            // bullet/indent
+            const heading = `↳ ${c.author ? c.author : 'Comment'} • ${fmt(c.created)}`;
+            doc.fontSize(10).fillColor('#333').text(heading, { indent: 16 });
+            if (c.body) {
+              doc.fontSize(10).fillColor('#222').text(stripHtml(c.body), { indent: 26, align: 'left' });
+            }
+          }
+        }
+
         doc.moveDown(0.25);
         doc.strokeColor('#ddd').lineWidth(1)
           .moveTo(doc.page.margins.left, doc.y)
@@ -130,73 +160,57 @@ export default async function handler(req, res) {
 function debugDateFields(items, type, reqId) {
   if (items.length > 0) {
     const sample = items[0];
-    const dateFields = Object.keys(sample).filter(key => 
-      key.toLowerCase().includes('date') || 
+    const dateFields = Object.keys(sample).filter(key =>
+      key.toLowerCase().includes('date') ||
       key.toLowerCase().includes('time') ||
       key.toLowerCase().includes('created') ||
       key.toLowerCase().includes('received') ||
       key.toLowerCase().includes('sent')
     );
-    
     dlog(`[${reqId}] ${type} sample date fields:`, {
       availableFields: dateFields,
-      sampleValues: dateFields.reduce((acc, field) => {
-        acc[field] = sample[field];
-        return acc;
-      }, {}),
-      allFields: Object.keys(sample).slice(0, 10) // Limit to first 10 fields to avoid spam
+      sampleValues: dateFields.reduce((acc, field) => { acc[field] = sample[field]; return acc; }, {}),
+      allFields: Object.keys(sample).slice(0, 10)
     });
   }
 }
 
 function extractDate(item, type) {
-  // Common date field names to try
-  const dateFields = type === 'note' 
-    ? [
-        'createdDate', 'created', 'date', 'dateCreated', 'createDate',
-        'timestamp', 'createdAt', 'dateTime', 'noteDate', 'updatedDate'
-      ]
-    : [
-        'dateReceived', 'dateSent', 'createdDate', 'created', 'date', 
-        'dateCreated', 'createDate', 'timestamp', 'createdAt', 'dateTime',
-        'receivedDate', 'sentDate', 'emailDate', 'updatedDate'
-      ];
-  
+  const dateFields = type === 'note'
+    ? ['createdDate','created','date','dateCreated','createDate','timestamp','createdAt','dateTime','noteDate','updatedDate']
+    : type === 'email'
+    ? ['dateReceived','dateSent','createdDate','created','date','dateCreated','createDate','timestamp','createdAt','dateTime','receivedDate','sentDate','emailDate','updatedDate']
+    : /* comment */ ['createdDate','created','date','timestamp','createdAt','dateTime','commentDate','updatedDate'];
+
   for (const field of dateFields) {
-    const value = item?.[field];
-    if (value) {
-      // Try to parse the date
-      const parsed = new Date(value);
-      if (!isNaN(parsed.getTime())) {
-        return value; // Return original value if it parses correctly
-      }
+    const v = item?.[field];
+    if (v) {
+      const parsed = new Date(v);
+      if (!isNaN(parsed.getTime())) return v;
     }
   }
-  
-  // If no valid date found, return current timestamp as fallback
-  console.warn(`No valid date found for ${type}:`, Object.keys(item || {}));
   return new Date().toISOString();
+}
+
+function extractAuthor(obj) {
+  return obj?.createdBy?.name
+      || obj?.author?.name
+      || obj?.user?.name
+      || (typeof obj?.createdBy === 'string' ? obj.createdBy : '')
+      || (typeof obj?.author === 'string' ? obj.author : '')
+      || (typeof obj?.user === 'string' ? obj.user : '');
 }
 
 function fmt(d) {
   if (!d) return 'No Date';
-  
   try {
     const date = new Date(d);
-    if (isNaN(date.getTime())) {
-      console.warn('Invalid date value:', d);
-      return 'Invalid Date';
-    }
-    return date.toLocaleString('en-US', { 
-      year: 'numeric',
-      month: '2-digit', 
-      day: '2-digit',
-      hour: '2-digit', 
-      minute: '2-digit',
-      hour12: false 
+    if (isNaN(date.getTime())) return 'Invalid Date';
+    return date.toLocaleString('en-US', {
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false
     });
-  } catch (err) {
-    console.warn('Date formatting error:', err.message, 'for value:', d);
+  } catch {
     return 'Date Error';
   }
 }
@@ -211,6 +225,8 @@ function stripHtml(html) {
     .replace(/[ \t]+/g, ' ')
     .trim();
 }
+
+/* ---- Auth / ID helpers ---- */
 
 async function getBearerToken(reqId) {
   const client_id = process.env.FILEVINE_CLIENT_ID;
@@ -256,7 +272,6 @@ async function getUserAndOrgIds(bearer, reqId) {
   }
   const data = await safeJson(resp, reqId, 'getUserOrgsWithToken');
 
-  // Robust extraction → **numbers/strings only**
   const userId = pickUserId(data);
   const orgId  = pickOrgId(data);
 
@@ -266,13 +281,7 @@ async function getUserAndOrgIds(bearer, reqId) {
 }
 
 function pickUserId(data) {
-  const candidates = [
-    data?.userId,
-    data?.user,
-    data?.user?.id,
-    data?.user?.userId,
-    data?.user?.native
-  ];
+  const candidates = [data?.userId, data?.user, data?.user?.id, data?.user?.userId, data?.user?.native];
   for (const c of candidates) {
     if (typeof c === 'number' || typeof c === 'string') return c;
     if (c && typeof c === 'object' && (typeof c.native === 'number' || typeof c.native === 'string')) return c.native;
@@ -281,19 +290,15 @@ function pickUserId(data) {
 }
 
 function pickOrgId(data) {
-  const candidates = [
-    data?.orgId,
-    data?.org,
-    data?.org?.id,
-    data?.orgs?.[0]?.orgId,
-    data?.orgs?.[0]?.id
-  ];
+  const candidates = [data?.orgId, data?.org, data?.org?.id, data?.orgs?.[0]?.orgId, data?.orgs?.[0]?.id];
   for (const c of candidates) {
     if (typeof c === 'number' || typeof c === 'string') return c;
     if (c && typeof c === 'object' && (typeof c.id === 'number' || typeof c.id === 'string')) return c.id;
   }
   return null;
 }
+
+/* ---- Fetching core lists (notes/emails) ---- */
 
 /**
  * Try multiple plausible endpoints/methods for "notes" or "emails".
@@ -305,20 +310,20 @@ async function pullWithStrategies(kind, projectId, bearer, userId, orgId, reqId)
 
   const strategies = kind === 'notes'
     ? [
-        { label: 'GET notes',              method: 'GET',  url: `${base}/notes` },
-        { label: 'GET activity/notes',     method: 'GET',  url: `${base}/activity/notes` },
-        { label: 'GET activity?types=note',method: 'GET',  url: `${base}/activity`, qp: { types: 'note' } },
-        { label: 'GET notes/list',         method: 'GET',  url: `${base}/notes/list` },
-        { label: 'POST notes',             method: 'POST', url: `${base}/notes`,      body: ({offset, limit}) => ({ offset, limit }) },
-        { label: 'POST notes/list',        method: 'POST', url: `${base}/notes/list`, body: ({offset, limit}) => ({ offset, limit }) },
+        { label: 'GET notes',               method: 'GET',  url: `${base}/notes` },
+        { label: 'GET activity/notes',      method: 'GET',  url: `${base}/activity/notes` },
+        { label: 'GET activity?types=note', method: 'GET',  url: `${base}/activity`, qp: { types: 'note' } },
+        { label: 'GET notes/list',          method: 'GET',  url: `${base}/notes/list` },
+        { label: 'POST notes',              method: 'POST', url: `${base}/notes`,      body: ({offset, limit}) => ({ offset, limit }) },
+        { label: 'POST notes/list',         method: 'POST', url: `${base}/notes/list`, body: ({offset, limit}) => ({ offset, limit }) },
       ]
     : [
-        { label: 'GET emails',              method: 'GET',  url: `${base}/emails` },
-        { label: 'GET activity/emails',     method: 'GET',  url: `${base}/activity/emails` },
-        { label: 'GET activity?types=email',method: 'GET',  url: `${base}/activity`, qp: { types: 'email' } },
-        { label: 'GET emails/list',         method: 'GET',  url: `${base}/emails/list` },
-        { label: 'POST emails',             method: 'POST', url: `${base}/emails`,      body: ({offset, limit}) => ({ offset, limit }) },
-        { label: 'POST emails/list',        method: 'POST', url: `${base}/emails/list`, body: ({offset, limit}) => ({ offset, limit }) },
+        { label: 'GET emails',               method: 'GET',  url: `${base}/emails` },
+        { label: 'GET activity/emails',      method: 'GET',  url: `${base}/activity/emails` },
+        { label: 'GET activity?types=email', method: 'GET',  url: `${base}/activity`, qp: { types: 'email' } },
+        { label: 'GET emails/list',          method: 'GET',  url: `${base}/emails/list` },
+        { label: 'POST emails',              method: 'POST', url: `${base}/emails`,      body: ({offset, limit}) => ({ offset, limit }) },
+        { label: 'POST emails/list',         method: 'POST', url: `${base}/emails/list`, body: ({offset, limit}) => ({ offset, limit }) },
       ];
 
   for (const strat of strategies) {
@@ -406,7 +411,112 @@ function inferHasMore(data, items, limit, _offset) {
   return items.length === limit;
 }
 
-/** Retry + logging for transient errors. */
+/* ---- Comments fetching for notes ---- */
+
+/**
+ * Attaches .comments[] array to each note.
+ * Attempts several likely routes for comment listing, with small concurrency.
+ */
+async function attachCommentsToNotes({ notes, projectId, token, userId, orgId, reqId }) {
+  if (!Array.isArray(notes) || !notes.length) return [];
+  const MAX_CONCURRENCY = 4;
+
+  const queue = [...notes];
+  const results = [];
+  let active = 0;
+
+  return await new Promise((resolve, reject) => {
+    const runNext = async () => {
+      if (!queue.length && active === 0) return resolve(results);
+      while (active < MAX_CONCURRENCY && queue.length) {
+        const note = queue.shift();
+        active++;
+        (async () => {
+          try {
+            const noteId = note?.id ?? note?.noteId;
+            const comments = noteId ? await getNoteComments(projectId, noteId, token, userId, orgId, reqId) : [];
+            results.push({ ...note, comments });
+          } catch (err) {
+            dlog(`[${reqId}] comments fetch failed`, { error: err?.message, noteId: note?.id ?? note?.noteId });
+            results.push({ ...note, comments: [] });
+          } finally {
+            active--;
+            runNext();
+          }
+        })();
+      }
+    };
+    runNext();
+  });
+}
+
+/**
+ * Try multiple plausible endpoints for comments on a single note.
+ * Returns a flat array of comment objects. Paginates if supported.
+ */
+async function getNoteComments(projectId, noteId, bearer, userId, orgId, reqId) {
+  const base = `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}`;
+  const limit = 50;
+
+  const strategies = [
+    // Likely forms
+    { label: 'GET notes/{id}/comments', method: 'GET',  url: `${base}/notes/${encodeURIComponent(noteId)}/comments` },
+    { label: 'GET activity/notes/{id}/comments', method: 'GET', url: `${base}/activity/notes/${encodeURIComponent(noteId)}/comments` },
+    { label: 'GET notes/{id}', method: 'GET', url: `${base}/notes/${encodeURIComponent(noteId)}`, inlineParse: true },
+    { label: 'POST notes/{id}/comments', method: 'POST', url: `${base}/notes/${encodeURIComponent(noteId)}/comments`, body: ({offset, limit}) => ({ offset, limit }) },
+    { label: 'GET comments?parentType=note', method: 'GET', url: `${base}/comments`, qp: { parentType: 'note', parentId: String(noteId) } },
+  ];
+
+  for (const strat of strategies) {
+    try {
+      if (strat.inlineParse) {
+        // Single GET returning the note; try to read embedded comments arrays if present
+        const resp = await fetchWithRetry(strat.url, {
+          headers: {
+            'Authorization': `Bearer ${bearer}`,
+            'x-fv-userid': String(userId),
+            'x-fv-orgid': String(orgId),
+            'Accept': 'application/json'
+          }
+        }, reqId);
+        dlog(`[${reqId}] comments single ${strat.label} response`, { status: resp.status, noteId });
+        if (!resp.ok) {
+          await logErrorBody(resp, reqId, `comment-inline(${strat.label})`);
+          throw new Error(`${strat.url} ${strat.method} error: ${resp.status}`);
+        }
+        const data = await safeJson(resp, reqId, `comment-inline(${strat.label})`);
+        const arrays = [
+          data?.comments, data?.replies, data?.items, data?.data, data?.results,
+          data?.commentItems, data?.page?.items
+        ];
+        const found = arrays.find(a => Array.isArray(a)) || [];
+        if (found.length) return found;
+        continue; // try next strategy if no array found
+      }
+
+      // Paged strategies
+      const comments = await pullAllPagesWithOneRoute(
+        strat,
+        bearer,
+        userId,
+        orgId,
+        limit,
+        reqId,
+        `comments[note:${noteId}]`
+      );
+      if (Array.isArray(comments)) return comments;
+    } catch (e) {
+      dlog(`[${reqId}] comments failed strategy`, { noteId, strategy: strat.label, error: e?.message });
+      continue;
+    }
+  }
+
+  // If none matched, return empty (don’t fail the whole PDF)
+  return [];
+}
+
+/* ---- generic fetch utils ---- */
+
 async function fetchWithRetry(input, init = {}, reqId, retries = 2, delayMs = 250) {
   let attempt = 0;
   while (true) {
