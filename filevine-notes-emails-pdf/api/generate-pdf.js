@@ -1,6 +1,4 @@
-Here’s the updated `generate-pdf.js` with comment fetching (normalized IDs to avoid the `%5Bobject%20Object%5D` bug), author extraction, and PDF rendering of note comments (including each comment’s author and timestamp).
-
-```javascript
+// generate-pdf.js
 import PDFDocument from 'pdfkit';
 
 /**
@@ -14,8 +12,8 @@ import PDFDocument from 'pdfkit';
  */
 
 const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
-const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2';     // non-regional
-const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2';     // Changed from v2-us to v2
+const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2'; // non-regional
+const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2'; // changed from v2-us to v2
 const DEBUG = (process.env.DEBUG ?? 'true').toLowerCase() !== 'false';
 
 const REQ = () => Math.random().toString(36).slice(2, 10);
@@ -40,18 +38,18 @@ export default async function handler(req, res) {
     // 1) Token
     const token = await getBearerToken(reqId);
 
-    // 2) Resolve user/org (ensure **numeric strings**)
+    // 2) Resolve user/org (ensure numeric strings)
     const { userId, orgId } = await getUserAndOrgIds(token, reqId);
     dlog(`[${reqId}] Using gateway headers`, { 'x-fv-userid': userId, 'x-fv-orgid': orgId });
 
-    // 3) Pull notes & emails (multi-strategy to be resilient)
+    // 3) Pull notes & emails
     const [notesRaw, emails] = await Promise.all([
       pullWithStrategies('notes', projectId, token, userId, orgId, reqId),
       pullWithStrategies('emails', projectId, token, userId, orgId, reqId)
     ]);
     dlog(`[${reqId}] Fetch complete`, { notesCount: notesRaw.length, emailsCount: emails.length });
 
-    // 3b) Attach comments to notes (normalized by native IDs; includes author)
+    // 3b) Fetch and attach comments for each note
     const notes = await attachCommentsToNotes({
       notes: notesRaw,
       projectId,
@@ -64,9 +62,7 @@ export default async function handler(req, res) {
     // 4) Normalize + merge chronologically
     const merged = [
       ...notes.map((n, index) => {
-        // Debug the first note
         if (index === 0) debugDateFields([n], 'Note', reqId);
-
         return {
           type: 'Note',
           id: normalizeId(n?.id ?? n?.noteId),
@@ -78,9 +74,7 @@ export default async function handler(req, res) {
         };
       }),
       ...emails.map((e, index) => {
-        // Debug the first email
         if (index === 0) debugDateFields([e], 'Email', reqId);
-
         return {
           type: 'Email',
           id: normalizeId(e?.id ?? e?.emailId),
@@ -101,7 +95,7 @@ export default async function handler(req, res) {
     const doc = new PDFDocument({ margin: 50, info: { Title: `Project ${projectId} Notes & Emails` } });
     doc.pipe(res);
 
-    doc.fontSize(20).text(`Project ${projectId} — Notes & Emails`, { underline: true });
+    doc.fontSize(20).text(`Project ${projectId} - Notes & Emails`, { underline: true });
     doc.moveDown(0.5);
     const generatedAt = new Date().toLocaleString('en-US', { hour12: false });
     doc.fontSize(10).fillColor('#666').text(`Generated: ${generatedAt}`);
@@ -124,12 +118,12 @@ export default async function handler(req, res) {
           doc.fontSize(11).fillColor('#111').text(stripHtml(item.body), { align: 'left' });
         }
 
-        // Render comments for notes (with author + timestamp)
+        // Render note comments (author + timestamp + body)
         if (item.type === 'Note' && Array.isArray(item.comments) && item.comments.length) {
           doc.moveDown(0.25);
           doc.fontSize(11).fillColor('#000').text(`Comments (${item.comments.length}):`);
           for (const c of item.comments) {
-            const header = `— ${fmt(c.created)}${c.author ? ` • ${c.author}` : ''}`;
+            const header = `- ${fmt(c.created)}${c.author ? ` • ${c.author}` : ''}`;
             doc.fontSize(10).fillColor('#333').text(header, { indent: 16 });
             if (c.body) {
               doc.fontSize(10).fillColor('#111').text(stripHtml(c.body), { indent: 32 });
@@ -187,13 +181,16 @@ function extractAuthor(obj) {
 function debugDateFields(items, type, reqId) {
   if (items.length > 0) {
     const sample = items[0];
-    const dateFields = Object.keys(sample).filter(key =>
-      key.toLowerCase().includes('date') ||
-      key.toLowerCase().includes('time') ||
-      key.toLowerCase().includes('created') ||
-      key.toLowerCase().includes('received') ||
-      key.toLowerCase().includes('sent')
-    );
+    const dateFields = Object.keys(sample).filter((key) => {
+      const k = key.toLowerCase();
+      return (
+        k.includes('date') ||
+        k.includes('time') ||
+        k.includes('created') ||
+        k.includes('received') ||
+        k.includes('sent')
+      );
+    });
 
     dlog(`[${reqId}] ${type} sample date fields:`, {
       availableFields: dateFields,
@@ -201,13 +198,12 @@ function debugDateFields(items, type, reqId) {
         acc[field] = sample[field];
         return acc;
       }, {}),
-      allFields: Object.keys(sample).slice(0, 10) // Limit to first 10 fields to avoid spam
+      allFields: Object.keys(sample).slice(0, 10)
     });
   }
 }
 
 function extractDate(item, type) {
-  // Common date field names to try
   const dateFields =
     type === 'note'
       ? [
@@ -221,7 +217,6 @@ function extractDate(item, type) {
           'receivedDate', 'sentDate', 'emailDate', 'updatedDate'
         ]
       : [
-          // comment or fallback
           'createdDate', 'created', 'date', 'dateCreated', 'createDate',
           'timestamp', 'createdAt', 'dateTime', 'commentDate', 'updatedDate'
         ];
@@ -231,19 +226,17 @@ function extractDate(item, type) {
     if (value) {
       const parsed = new Date(value);
       if (!isNaN(parsed.getTime())) {
-        return value; // Return original value if it parses correctly
+        return value;
       }
     }
   }
 
-  // If no valid date found, return current timestamp as fallback
   console.warn(`No valid date found for ${type}:`, Object.keys(item || {}));
   return new Date().toISOString();
 }
 
 function fmt(d) {
   if (!d) return 'No Date';
-
   try {
     const date = new Date(d);
     if (isNaN(date.getTime())) {
@@ -278,7 +271,7 @@ function stripHtml(html) {
 async function getBearerToken(reqId) {
   const client_id = process.env.FILEVINE_CLIENT_ID;
   const client_secret = process.env.FILEVINE_CLIENT_SECRET;
-  const pat_token = process.env.FILEVINE_PAT_TOKEN; // Personal Access Token
+  const pat_token = process.env.FILEVINE_PAT_TOKEN;
   if (!client_id || !client_secret || !pat_token) throw new Error('Missing Filevine credentials in env vars');
 
   const body = new URLSearchParams();
@@ -302,7 +295,7 @@ async function getBearerToken(reqId) {
   const data = await safeJson(resp, reqId, 'identity');
   if (!data.access_token) throw new Error('No access_token in identity response');
   dlog(`[${reqId}] Token acquired (length)`, { accessTokenLength: String(data.access_token).length });
-  return data.access_token; // never log token value
+  return data.access_token;
 }
 
 async function getUserAndOrgIds(bearer, reqId) {
@@ -319,7 +312,6 @@ async function getUserAndOrgIds(bearer, reqId) {
   }
   const data = await safeJson(resp, reqId, 'getUserOrgsWithToken');
 
-  // Robust extraction → **numbers/strings only**
   const userId = pickUserId(data);
   const orgId  = pickOrgId(data);
 
@@ -373,7 +365,7 @@ async function pullWithStrategies(kind, projectId, bearer, userId, orgId, reqId)
         { label: 'GET activity?types=note',method: 'GET',  url: `${base}/activity`, qp: { types: 'note' } },
         { label: 'GET notes/list',         method: 'GET',  url: `${base}/notes/list` },
         { label: 'POST notes',             method: 'POST', url: `${base}/notes`,      body: ({offset, limit}) => ({ offset, limit }) },
-        { label: 'POST notes/list',        method: 'POST', url: `${base}/notes/list`, body: ({offset, limit}) => ({ offset, limit }) },
+        { label: 'POST notes/list',        method: 'POST', url: `${base}/notes/list`, body: ({offset, limit}) => ({ offset, limit }) }
       ]
     : [
         { label: 'GET emails',              method: 'GET',  url: `${base}/emails` },
@@ -381,7 +373,7 @@ async function pullWithStrategies(kind, projectId, bearer, userId, orgId, reqId)
         { label: 'GET activity?types=email',method: 'GET',  url: `${base}/activity`, qp: { types: 'email' } },
         { label: 'GET emails/list',         method: 'GET',  url: `${base}/emails/list` },
         { label: 'POST emails',             method: 'POST', url: `${base}/emails`,      body: ({offset, limit}) => ({ offset, limit }) },
-        { label: 'POST emails/list',        method: 'POST', url: `${base}/emails/list`, body: ({offset, limit}) => ({ offset, limit }) },
+        { label: 'POST emails/list',        method: 'POST', url: `${base}/emails/list`, body: ({offset, limit}) => ({ offset, limit }) }
       ];
 
   for (const strat of strategies) {
@@ -528,9 +520,8 @@ function previewJson(obj, maxKeys = 20) {
   const preview = {};
   for (const k of keys) {
     const v = obj[k];
-    preview[k] = (k.toLowerCase().includes('token') || k.toLowerCase().includes('secret'))
-      ? '[redacted]'
-      : summarize(v);
+    const low = k.toLowerCase();
+    preview[k] = (low.includes('token') || low.includes('secret')) ? '[redacted]' : summarize(v);
   }
   return preview;
 }
@@ -543,7 +534,7 @@ function summarize(v) {
   return s.length > 160 ? s.slice(0, 160) + '…' : s;
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 /* ---------- comments helpers & flow ---------- */
 
@@ -556,8 +547,8 @@ function extractEmbeddedComments(note) {
     note?.thread?.comments,
     note?.page?.items
   ];
-  const found = arrays.find(a => Array.isArray(a)) || [];
-  return found.map(c => ({
+  const found = arrays.find((a) => Array.isArray(a)) || [];
+  return found.map((c) => ({
     id: normalizeId(c?.id ?? c?.commentId),
     created: extractDate(c, 'comment'),
     author: extractAuthor(c),
@@ -630,7 +621,7 @@ async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId,
   const nid  = encodeURIComponent(String(noteId));
   const limit = 50;
 
-  // Try explicit per-item link first
+  // Try explicit link first if present on the note
   if (explicitUrl) {
     try {
       const items = await pullAllPagesWithOneRoute(
@@ -649,7 +640,7 @@ async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId,
     { label: 'POST notes/{id}/comments', method: 'POST', url: `${base}/notes/${nid}/comments`,
       body: ({offset, limit}) => ({ offset, limit }) },
 
-    // collection-level comments endpoints
+    // collection-level
     { label: 'GET comments',             method: 'GET',  url: `${base}/comments`, qp: { parentType: 'note', parentId: String(noteId) } },
     { label: 'GET comments/list',        method: 'GET',  url: `${base}/comments/list`, qp: { parentType: 'note', parentId: String(noteId), limit, offset: 0 } },
     { label: 'POST comments',            method: 'POST', url: `${base}/comments`,
@@ -659,7 +650,7 @@ async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId,
 
     // activity fallback
     { label: 'GET activity?types=comment', method: 'GET',
-      url: `${base}/activity`, qp: { types: 'comment', parentType: 'note', parentId: String(noteId) } },
+      url: `${base}/activity`, qp: { types: 'comment', parentType: 'note', parentId: String(noteId) } }
   ];
 
   for (const strat of strategies) {
@@ -678,11 +669,10 @@ async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId,
 }
 
 function normalizeComments(items) {
-  return items.map(c => ({
+  return items.map((c) => ({
     id: normalizeId(c?.id ?? c?.commentId),
     created: extractDate(c, 'comment'),
     author: extractAuthor(c),
     body: c?.body || c?.text || c?.content || ''
   }));
 }
-```
