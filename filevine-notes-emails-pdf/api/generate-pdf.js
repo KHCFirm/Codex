@@ -49,8 +49,11 @@ export default async function handler(req, res) {
     ]);
     dlog(`[${reqId}] Fetch complete`, { notesCount: notesRaw.length, emailsCount: emails.length });
 
-    // 3b) Attach comments to notes (normalized by native IDs; includes author)
-    const notes = await attachCommentsToNotes({
+    // 3a) DEBUG: show author candidates for the first note we got back
+    debugNoteAuthorFields(notesRaw, reqId);
+
+    // 3b) Attach comments to notes
+    const notesWithComments = await attachCommentsToNotes({
       notes: notesRaw,
       projectId,
       token,
@@ -59,15 +62,27 @@ export default async function handler(req, res) {
       reqId
     });
 
+    // 3c) Enrich authors for notes missing a clear author (follows HAL _links.createdBy)
+    await enrichNoteAuthors(notesWithComments, token, userId, orgId, reqId);
+
+    // 3d) DEBUG: show the extracted/enriched author outcome for the first note
+    if (Array.isArray(notesWithComments) && notesWithComments.length) {
+      const first = notesWithComments[0];
+      dlog(`[${reqId}] First note author extracted`, {
+        extracted: extractNoteAuthor(first),
+        enriched: first?.__author ?? null
+      });
+    }
+
     // 4) Normalize + merge chronologically
     const merged = [
-      ...notes.map((n, index) => {
+      ...notesWithComments.map((n, index) => {
         if (index === 0) debugDateFields([n], 'Note', reqId);
         return {
           type: 'Note',
           id: normalizeId(n?.id ?? n?.noteId),
           created: extractDate(n, 'note'),
-          author: extractNoteAuthor(n),       // ← ensure note author
+          author: n?.__author || extractNoteAuthor(n), // ← prefer enriched, fallback to extractor
           title: n?.title || n?.subject || '',
           body: n?.body || n?.text || n?.content || '',
           comments: Array.isArray(n?.comments) ? n.comments : []
@@ -214,7 +229,21 @@ function extractNoteAuthor(note) {
     const name = pickName(c);
     if (name) return name;
   }
-  // 3) Fallback to the generic extractor (covers some additional shapes)
+
+  // 3) Check embedded users, if any, with ID matching
+  const idCandidates = collectAuthorIdCandidates(note);
+  const users = note?._embedded?.users || note?.embedded?.users;
+  if (Array.isArray(users) && idCandidates.length) {
+    for (const u of users) {
+      const uid = String(u?.id ?? u?.userId ?? u?.native ?? '');
+      if (uid && idCandidates.includes(uid)) {
+        const nm = pickName(u);
+        if (nm) return nm;
+      }
+    }
+  }
+
+  // 4) Fallback to the generic extractor (covers some additional shapes)
   return extractAuthor(note);
 }
 
@@ -234,6 +263,49 @@ function pickName(x) {
     if (x.title && typeof x.title === 'string') return x.title;
   }
   return '';
+}
+
+function collectAuthorIdCandidates(note) {
+  const ids = [];
+  const push = (v) => { if (v != null) ids.push(String(v)); };
+  push(note?.createdById);
+  push(note?.createdByUserId);
+  push(note?.userId);
+  push(note?.authorId);
+  if (note?.createdBy && typeof note.createdBy === 'object') {
+    push(note.createdBy.id);
+    push(note.createdBy.userId);
+    push(note.createdBy.native);
+  }
+  return ids.filter(Boolean);
+}
+
+function debugNoteAuthorFields(notes, reqId) {
+  if (!Array.isArray(notes) || !notes.length) return;
+  const n = notes[0];
+  const snapshot = {
+    createdBy: summarize(n?.createdBy),
+    createdByUser: summarize(n?.createdByUser),
+    author: summarize(n?.author),
+    user: summarize(n?.user),
+    owner: summarize(n?.owner),
+    from: summarize(n?.from),
+    sender: summarize(n?.sender),
+    createdByName: n?.createdByName,
+    createdByDisplayName: n?.createdByDisplayName,
+    authorName: n?.authorName,
+    userFullName: n?.userFullName,
+    userName: n?.userName,
+    displayName: n?.displayName,
+    fullName: n?.fullName,
+    createdById:
+      n?.createdById ?? n?.createdByUserId ?? n?.userId ?? n?.authorId ??
+      (typeof n?.createdBy === 'object' && (n.createdBy.id ?? n.createdBy.native)) ?? null,
+    '_links.createdBy': summarize(n?._links?.createdBy),
+    '_embedded.createdBy': summarize(n?._embedded?.createdBy),
+    '_embedded.users.len': Array.isArray(n?._embedded?.users) ? n._embedded.users.length : 0
+  };
+  dlog(`[${reqId}] First note author debug`, snapshot);
 }
 
 function debugDateFields(items, type, reqId) {
@@ -321,7 +393,7 @@ function stripHtml(html) {
 }
 
 function toAbsoluteUrl(pathOrUrl) {
-  // If Filevine returns a relative HAL link (e.g., "/notes/{id}/comments"), make it absolute.
+  // If Filevine returns a relative HAL link (e.g., "/users/{id}"), make it absolute.
   try {
     return new URL(pathOrUrl, GATEWAY_REGION_BASE).toString();
   } catch {
@@ -625,7 +697,6 @@ function extractEmbeddedComments(note) {
 }
 
 function commentsLinkFromNote(note) {
-  // Support a few HAL shapes; prefer string hrefs.
   const candidate =
     note?._links?.comments?.href ||
     note?._links?.comments ||
@@ -731,4 +802,116 @@ function normalizeComments(items) {
     author: extractAuthor(c),
     body: c?.body || c?.text || c?.content || ''
   }));
+}
+
+/* ---------- author enrichment ---------- */
+
+function createdByLinkFromNote(note) {
+  return (
+    (note?._links?.createdBy?.href || note?._links?.createdBy) ||
+    (note?.links?.createdBy?.href   || note?.links?.createdBy) ||
+    null
+  ) ? String((note?._links?.createdBy?.href || note?._links?.createdBy || note?.links?.createdBy?.href || note?.links?.createdBy)) : null;
+}
+
+/**
+ * For notes whose author name isn't obvious, try to resolve it by:
+ *  1) Following the HAL createdBy link (GET that URL, cache it, pick a name)
+ *  2) Matching against _embedded.users (if present) by creator id
+ */
+async function enrichNoteAuthors(notes, bearer, userId, orgId, reqId) {
+  if (!Array.isArray(notes) || !notes.length) return;
+
+  // Which notes still lack an author name?
+  const unresolved = notes.filter(n => {
+    const already = n?.__author || extractNoteAuthor(n);
+    return !already;
+  });
+  if (!unresolved.length) {
+    dlog(`[${reqId}] author enrichments`, { totalNotes: notes.length, unresolvedBefore: 0, unresolvedAfter: 0 });
+    return;
+  }
+
+  // 1) Follow HAL createdBy links (dedup + cache)
+  const hrefToNotes = new Map();
+  for (const n of unresolved) {
+    const href = createdByLinkFromNote(n);
+    if (href) {
+      const abs = toAbsoluteUrl(href);
+      if (!hrefToNotes.has(abs)) hrefToNotes.set(abs, []);
+      hrefToNotes.get(abs).push(n);
+    }
+  }
+
+  const entries = Array.from(hrefToNotes.entries());
+  const authorCache = new Map();
+  const MAX_CONCURRENCY = Math.min(6, Math.max(1, entries.length));
+  let idx = 0;
+
+  async function worker() {
+    while (idx < entries.length) {
+      const [abs, bucket] = entries[idx++];
+      try {
+        const init = {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${bearer}`,
+            'x-fv-userid': String(userId),
+            'x-fv-orgid': String(orgId),
+            'Accept': 'application/json'
+          }
+        };
+        dlog(`[${reqId}] GET ${abs} (author-resolve)`);
+        const resp = await fetchWithRetry(abs, init, reqId);
+        dlog(`[${reqId}] author-resolve response`, { status: resp.status });
+        if (!resp.ok) {
+          await logErrorBody(resp, reqId, 'author-resolve');
+          continue;
+        }
+        const data = await safeJson(resp, reqId, 'author-resolve');
+        const name =
+          pickName(data) ||
+          pickName(data?.user) ||
+          pickName(data?.person) ||
+          pickName(data?.profile) ||
+          data?.displayName ||
+          data?.fullName ||
+          data?.name ||
+          '';
+        if (name) {
+          authorCache.set(abs, name);
+          for (const n of bucket) n.__author = name;
+        } else {
+          dlog(`[${reqId}] author-resolve no usable name`, { keys: Object.keys(data || {}) });
+        }
+      } catch (e) {
+        dlog(`[${reqId}] author-resolve failed`, { url: abs, error: e?.message });
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: MAX_CONCURRENCY }, () => worker()));
+
+  // 2) Embedded users matching by id (for any still unresolved)
+  for (const n of unresolved) {
+    if (n.__author) continue;
+    const idCandidates = collectAuthorIdCandidates(n);
+    const users = n?._embedded?.users || n?.embedded?.users;
+    if (Array.isArray(users) && idCandidates.length) {
+      for (const u of users) {
+        const uid = String(u?.id ?? u?.userId ?? u?.native ?? '');
+        if (uid && idCandidates.includes(uid)) {
+          const nm = pickName(u);
+          if (nm) { n.__author = nm; break; }
+        }
+      }
+    }
+  }
+
+  const still = notes.filter(n => !(n.__author || extractNoteAuthor(n))).length;
+  dlog(`[${reqId}] author enrichments`, {
+    totalNotes: notes.length,
+    unresolvedBefore: unresolved.length,
+    unresolvedAfter: still,
+    halLinksFollowed: entries.length
+  });
 }
