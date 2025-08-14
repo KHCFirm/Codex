@@ -67,7 +67,7 @@ export default async function handler(req, res) {
           type: 'Note',
           id: normalizeId(n?.id ?? n?.noteId),
           created: extractDate(n, 'note'),
-          author: extractAuthor(n),
+          author: extractNoteAuthor(n),       // ← ensure note author
           title: n?.title || n?.subject || '',
           body: n?.body || n?.text || n?.content || '',
           comments: Array.isArray(n?.comments) ? n.comments : []
@@ -162,6 +162,7 @@ function normalizeId(v) {
   return String(v);
 }
 
+/** Generic author extractor used for emails/comments (kept as-is). */
 function extractAuthor(obj) {
   return (
     obj?.createdBy?.name ||
@@ -176,6 +177,63 @@ function extractAuthor(obj) {
     obj?.sender ||
     ''
   );
+}
+
+/** NOTE-SPECIFIC author extractor: checks common v2 shapes, including HAL. */
+function extractNoteAuthor(note) {
+  // 1) If HAL link exposes a title for the creator, prefer it
+  const halCreatedBy =
+    (note?._links?.createdBy && typeof note._links.createdBy === 'object' && note._links.createdBy.title) ||
+    (note?.links?.createdBy && typeof note.links.createdBy === 'object' && note.links.createdBy.title);
+  if (halCreatedBy && typeof halCreatedBy === 'string') return halCreatedBy;
+
+  // 2) Try rich/nested objects and common flat name fields
+  const candidates = [
+    note?.createdBy,
+    note?.createdByUser,
+    note?.author,
+    note?.user,
+    note?.owner,
+    note?.sender,
+    note?.from,
+    note?._embedded?.createdBy,
+    note?._embedded?.createdByUser,
+    note?._embedded?.author,
+    note?._embedded?.user,
+    note?._embedded?.owner,
+    note?.createdByName,
+    note?.createdByDisplayName,
+    note?.authorName,
+    note?.userFullName,
+    note?.userName,
+    note?.displayName,
+    note?.fullName
+  ];
+
+  for (const c of candidates) {
+    const name = pickName(c);
+    if (name) return name;
+  }
+  // 3) Fallback to the generic extractor (covers some additional shapes)
+  return extractAuthor(note);
+}
+
+/** Convert different object shapes into a name string. */
+function pickName(x) {
+  if (!x) return '';
+  if (typeof x === 'string') return x;
+  if (typeof x === 'object') {
+    const name =
+      x.name ||
+      x.fullName ||
+      x.displayName ||
+      x.userFullName ||
+      (x.firstName || x.lastName ? `${x.firstName ?? ''} ${x.lastName ?? ''}`.trim() : '');
+    if (name) return String(name);
+    // Sometimes the HAL link object carries a title key
+    if (x.title && typeof x.title === 'string') return x.title;
+  }
+  return '';
 }
 
 function debugDateFields(items, type, reqId) {
@@ -459,14 +517,12 @@ function extractItems(data) {
   if (Array.isArray(data.data)) return data.data;
   if (Array.isArray(data.activityItems)) return data.activityItems;
   if (data.page && Array.isArray(data.page.items)) return data.page.items;
-  // Some endpoints may wrap in { comments: [] } — keep a defensive fallback:
   if (Array.isArray(data.comments)) return data.comments;
   return [];
 }
 
 function inferHasMore(data, items, limit, _offset) {
-  if (data?.hasMore === true) return true; // strict boolean
-  // Some gateways serialize booleans as strings:
+  if (data?.hasMore === true) return true;
   if (typeof data?.hasMore === 'string' && data.hasMore.toLowerCase() === 'true') return true;
   if (data?.nextOffset != null) return true;
   return items.length === limit;
