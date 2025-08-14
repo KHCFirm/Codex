@@ -1,646 +1,917 @@
-#!/usr/bin/env node
-/* eslint-disable no-console */
-/**
- * Filevine Notes & Emails → PDF (with comments), robust link fallback, de-dup, and author resolution.
- * Node 18+ (global fetch). Output: ./project-{id}-notes-emails-{YYYY-MM-DD}.pdf
- *
- * Key improvements (based on your log & sample PDF):
- *  - Fix: treat 200 with 0 comment items as success, not "failed".
- *  - Fallback: /notes/{id}/comments -> /fv-app/v2/notes/{id}/comments.
- *  - Resolve createdById.native to user full name via /fv-app/v2/users/{id}, with cache.
- *  - De-dup emails/notes that mirror each other in Filevine (subject/body/date/recipients).
- *  - Safer PDF link detection + wrapping (no mid-URL split).
- */
-
-import fs from 'node:fs';
-import fsp from 'node:fs/promises';
-import path from 'node:path';
-import crypto from 'node:crypto';
-import process from 'node:process';
 import PDFDocument from 'pdfkit';
 
-/* ----------------------------- Config & Helpers ---------------------------- */
+/**
+ * Env vars
+ *  - FILEVINE_CLIENT_ID
+ *  - FILEVINE_CLIENT_SECRET
+ *  - FILEVINE_PAT_TOKEN
+ *  - DEBUG (optional: "true" | "false"; default "true")
+ *
+ * New API gateway (global): api.filevineapp.com/fv-app/v2
+ * Notes/comments are NOT project-scoped in v2; use /notes/{noteId}/comments.
+ */
 
-const CONFIG = {
-  identityBase: process.env.FILEVINE_IDENTITY_BASE || 'https://identity.filevine.com',
-  apiBase: process.env.FILEVINE_API_BASE || 'https://api.filevineapp.com',
-  v2Base: '/fv-app/v2',
-  clientId: process.env.FILEVINE_CLIENT_ID,
-  clientSecret: process.env.FILEVINE_CLIENT_SECRET,
-  scope:
-    process.env.FILEVINE_SCOPE ||
-    'email filevine.v2.api.* fv.api.gateway.access fv.auth.tenant.read openid tenant',
-  accessToken: process.env.FILEVINE_ACCESS_TOKEN, // if set, skip token exchange
-  outputDir: process.cwd(),
-  pageSize: 'LETTER',
-  margin: 50,
-  pdfFontSize: 11,
-  titleFontSize: 16,
-  h2FontSize: 12,
-  /* If set > 0, very long bodies/comments will be truncated to this length (adds " …[truncated]"). */
-  softLimitBodyChars: 0, // set e.g. 20000 if you need to cap massive disclaimers
-};
+const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
+const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2'; // non-regional
+const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2'; // keep global v2
+const DEBUG = (process.env.DEBUG ?? 'true').toLowerCase() !== 'false';
 
-const traceId = randomId();
+const REQ = () => Math.random().toString(36).slice(2, 10);
+const dlog = (...args) => { if (DEBUG) console.log('[debug]', ...args); };
 
-function randomId() {
-  return Math.random().toString(36).slice(2, 10);
-}
-function log(level, msg, ctx = {}) {
-  const iso = new Date().toISOString();
-  const ns = `[${traceId}]`;
-  const payload = Object.keys(ctx).length ? ' ' + JSON.stringify(ctx) : '';
-  console.log(`${iso} [info] [${level}] ${ns} ${msg}${payload}`);
-}
-function jsonPreview(obj, inlineKeys = []) {
-  const clone = {};
-  for (const k of Object.keys(obj || {})) {
-    const v = obj[k];
-    if (v == null) clone[k] = v;
-    else if (typeof v === 'string') clone[k] = v.length > 60 ? `${v.slice(0, 57)}…` : v;
-    else if (Array.isArray(v)) clone[k] = `[array len=${v.length}]`;
-    else if (typeof v === 'object') clone[k] = `{object keys=${Object.keys(v).length}}`;
-    else clone[k] = v;
-  }
-  for (const k of inlineKeys) if (obj?.[k] != null) clone[k] = obj[k];
-  return clone;
-}
-function toDate(d) {
-  // accept epoch ms, ISO string, or Filevine style strings
-  if (!d) return null;
+export default async function handler(req, res) {
+  const reqId = REQ();
   try {
-    const n = +d;
-    if (!Number.isNaN(n) && n > 0) return new Date(n);
-  } catch {}
-  const dt = new Date(d);
-  return isNaN(dt) ? null : dt;
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const projectId = url.searchParams.get('projectId');
+    if (!projectId) {
+      res.statusCode = 400;
+      return res.end('Missing projectId');
+    }
+
+    dlog(`[${reqId}] Start`, {
+      utilsBase: GATEWAY_UTILS_BASE,
+      regionBase: GATEWAY_REGION_BASE,
+      projectId
+    });
+
+    // 1) Token
+    const token = await getBearerToken(reqId);
+
+    // 2) Resolve user/org (ensure **numeric strings**)
+    const { userId, orgId } = await getUserAndOrgIds(token, reqId);
+    dlog(`[${reqId}] Using gateway headers`, { 'x-fv-userid': userId, 'x-fv-orgid': orgId });
+
+    // 3) Pull notes & emails
+    const [notesRaw, emails] = await Promise.all([
+      pullWithStrategies('notes', projectId, token, userId, orgId, reqId),
+      pullWithStrategies('emails', projectId, token, userId, orgId, reqId)
+    ]);
+    dlog(`[${reqId}] Fetch complete`, { notesCount: notesRaw.length, emailsCount: emails.length });
+
+    // 3a) DEBUG: show author candidates for the first note we got back
+    debugNoteAuthorFields(notesRaw, reqId);
+
+    // 3b) Attach comments to notes
+    const notesWithComments = await attachCommentsToNotes({
+      notes: notesRaw,
+      projectId,
+      token,
+      userId,
+      orgId,
+      reqId
+    });
+
+    // 3c) Enrich authors for notes missing a clear author (follows HAL _links.createdBy)
+    await enrichNoteAuthors(notesWithComments, token, userId, orgId, reqId);
+
+    // 3d) DEBUG: show the extracted/enriched author outcome for the first note
+    if (Array.isArray(notesWithComments) && notesWithComments.length) {
+      const first = notesWithComments[0];
+      dlog(`[${reqId}] First note author extracted`, {
+        extracted: extractNoteAuthor(first),
+        enriched: first?.__author ?? null
+      });
+    }
+
+    // 4) Normalize + merge chronologically
+    const merged = [
+      ...notesWithComments.map((n, index) => {
+        if (index === 0) debugDateFields([n], 'Note', reqId);
+        return {
+          type: 'Note',
+          id: normalizeId(n?.id ?? n?.noteId),
+          created: extractDate(n, 'note'),
+          author: n?.__author || extractNoteAuthor(n), // ← prefer enriched, fallback to extractor
+          title: n?.title || n?.subject || '',
+          body: n?.body || n?.text || n?.content || '',
+          comments: Array.isArray(n?.comments) ? n.comments : []
+        };
+      }),
+      ...emails.map((e, index) => {
+        if (index === 0) debugDateFields([e], 'Email', reqId);
+        return {
+          type: 'Email',
+          id: normalizeId(e?.id ?? e?.emailId),
+          created: extractDate(e, 'email'),
+          author: extractAuthor(e),
+          title: e?.subject || e?.title || '',
+          body: e?.body || e?.content || e?.text || ''
+        };
+      })
+    ].sort((a, b) => new Date(a.created || 0) - new Date(b.created || 0));
+
+    dlog(`[${reqId}] Merge complete`, { mergedCount: merged.length });
+
+    // 5) PDF stream
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Cache-Control', 'no-store');
+
+    const doc = new PDFDocument({ margin: 50, info: { Title: `Project ${projectId} Notes & Emails` } });
+    doc.pipe(res);
+
+    doc.fontSize(20).text(`Project ${projectId} — Notes & Emails`, { underline: true });
+    doc.moveDown(0.5);
+    const generatedAt = new Date().toLocaleString('en-US', { hour12: false });
+    doc.fontSize(10).fillColor('#666').text(`Generated: ${generatedAt}`);
+    doc.moveDown();
+
+    if (!merged.length) {
+      doc.fontSize(12).fillColor('#000').text('No notes or emails found.');
+    } else {
+      for (const item of merged) {
+        doc.moveDown();
+        doc
+          .fontSize(12)
+          .fillColor('#000')
+          .text(`${item.type} • ${fmt(item.created)}${item.author ? ` • ${item.author}` : ''}`);
+        if (item.title) {
+          doc.font('Helvetica-Bold').text(item.title);
+          doc.font('Helvetica');
+        }
+        if (item.body) {
+          doc.fontSize(11).fillColor('#111').text(stripHtml(item.body), { align: 'left' });
+        }
+
+        // Render comments for notes (with author + timestamp)
+        if (item.type === 'Note' && Array.isArray(item.comments) && item.comments.length) {
+          doc.moveDown(0.25);
+          doc.fontSize(11).fillColor('#000').text(`Comments (${item.comments.length}):`);
+          for (const c of item.comments) {
+            const header = `— ${fmt(c.created)}${c.author ? ` • ${c.author}` : ''}`;
+            doc.fontSize(10).fillColor('#333').text(header, { indent: 16 });
+            if (c.body) {
+              doc.fontSize(10).fillColor('#111').text(stripHtml(c.body), { indent: 32 });
+            }
+            doc.moveDown(0.1);
+          }
+        }
+
+        doc.moveDown(0.25);
+        doc.strokeColor('#ddd').lineWidth(1)
+          .moveTo(doc.page.margins.left, doc.y)
+          .lineTo(doc.page.width - doc.page.margins.right, doc.y)
+          .stroke();
+      }
+    }
+
+    doc.end();
+    dlog(`[${reqId}] PDF streamed`);
+  } catch (err) {
+    console.error(`[error][${reqId}]`, { message: err?.message, stack: err?.stack });
+    res.statusCode = 500;
+    res.setHeader('Content-Type', 'text/plain');
+    res.end(`Error (${reqId}): ${err.message}`);
+  }
 }
-function fmtDate(d) {
-  if (!d) return '';
-  // Use server-local TZ unless overridden by TZ env var
-  const f = new Intl.DateTimeFormat(undefined, {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-  return f.format(d);
+
+/* ---------- helpers ---------- */
+
+function normalizeId(v) {
+  if (v == null) return null;
+  if (typeof v === 'object') {
+    if (v.native != null) return String(v.native);
+    if (v.id != null) return String(v.id);
+    if (v.noteId != null) return String(v.noteId);
+  }
+  return String(v);
 }
-function normText(s) {
-  return (s || '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\u0000|\u0001|\u0002/g, '') // strip stray control chars
+
+/** Generic author extractor used for emails/comments (kept as-is). */
+function extractAuthor(obj) {
+  return (
+    obj?.createdBy?.name ||
+    obj?.author?.name ||
+    obj?.user?.name ||
+    obj?.from?.name ||
+    obj?.sender?.name ||
+    obj?.createdBy ||
+    obj?.author ||
+    obj?.user ||
+    obj?.from ||
+    obj?.sender ||
+    ''
+  );
+}
+
+/** NOTE-SPECIFIC author extractor: checks common v2 shapes, including HAL. */
+function extractNoteAuthor(note) {
+  // 1) If HAL link exposes a title for the creator, prefer it
+  const halCreatedBy =
+    (note?._links?.createdBy && typeof note._links.createdBy === 'object' && note._links.createdBy.title) ||
+    (note?.links?.createdBy && typeof note.links.createdBy === 'object' && note.links.createdBy.title);
+  if (halCreatedBy && typeof halCreatedBy === 'string') return halCreatedBy;
+
+  // 2) Try rich/nested objects and common flat name fields
+  const candidates = [
+    note?.createdBy,
+    note?.createdByUser,
+    note?.author,
+    note?.user,
+    note?.owner,
+    note?.sender,
+    note?.from,
+    note?._embedded?.createdBy,
+    note?._embedded?.createdByUser,
+    note?._embedded?.author,
+    note?._embedded?.user,
+    note?._embedded?.owner,
+    note?.createdByName,
+    note?.createdByDisplayName,
+    note?.authorName,
+    note?.userFullName,
+    note?.userName,
+    note?.displayName,
+    note?.fullName
+  ];
+
+  for (const c of candidates) {
+    const name = pickName(c);
+    if (name) return name;
+  }
+
+  // 3) Check embedded users, if any, with ID matching
+  const idCandidates = collectAuthorIdCandidates(note);
+  const users = note?._embedded?.users || note?.embedded?.users;
+  if (Array.isArray(users) && idCandidates.length) {
+    for (const u of users) {
+      const uid = String(u?.id ?? u?.userId ?? u?.native ?? '');
+      if (uid && idCandidates.includes(uid)) {
+        const nm = pickName(u);
+        if (nm) return nm;
+      }
+    }
+  }
+
+  // 4) Fallback to the generic extractor (covers some additional shapes)
+  return extractAuthor(note);
+}
+
+/** Convert different object shapes into a name string. */
+function pickName(x) {
+  if (!x) return '';
+  if (typeof x === 'string') return x;
+  if (typeof x === 'object') {
+    const name =
+      x.name ||
+      x.fullName ||
+      x.displayName ||
+      x.userFullName ||
+      (x.firstName || x.lastName ? `${x.firstName ?? ''} ${x.lastName ?? ''}`.trim() : '');
+    if (name) return String(name);
+    // Sometimes the HAL link object carries a title key
+    if (x.title && typeof x.title === 'string') return x.title;
+  }
+  return '';
+}
+
+function collectAuthorIdCandidates(note) {
+  const ids = [];
+  const push = (v) => { if (v != null) ids.push(String(v)); };
+  push(note?.createdById);
+  push(note?.createdByUserId);
+  push(note?.userId);
+  push(note?.authorId);
+  if (note?.createdBy && typeof note.createdBy === 'object') {
+    push(note.createdBy.id);
+    push(note.createdBy.userId);
+    push(note.createdBy.native);
+  }
+  return ids.filter(Boolean);
+}
+
+function debugNoteAuthorFields(notes, reqId) {
+  if (!Array.isArray(notes) || !notes.length) return;
+  const n = notes[0];
+  const snapshot = {
+    createdBy: summarize(n?.createdBy),
+    createdByUser: summarize(n?.createdByUser),
+    author: summarize(n?.author),
+    user: summarize(n?.user),
+    owner: summarize(n?.owner),
+    from: summarize(n?.from),
+    sender: summarize(n?.sender),
+    createdByName: n?.createdByName,
+    createdByDisplayName: n?.createdByDisplayName,
+    authorName: n?.authorName,
+    userFullName: n?.userFullName,
+    userName: n?.userName,
+    displayName: n?.displayName,
+    fullName: n?.fullName,
+    createdById:
+      n?.createdById ?? n?.createdByUserId ?? n?.userId ?? n?.authorId ??
+      (typeof n?.createdBy === 'object' && (n.createdBy.id ?? n.createdBy.native)) ?? null,
+    '_links.createdBy': summarize(n?._links?.createdBy),
+    '_embedded.createdBy': summarize(n?._embedded?.createdBy),
+    '_embedded.users.len': Array.isArray(n?._embedded?.users) ? n._embedded.users.length : 0
+  };
+  dlog(`[${reqId}] First note author debug`, snapshot);
+}
+
+function debugDateFields(items, type, reqId) {
+  if (items.length > 0) {
+    const sample = items[0];
+    const dateFields = Object.keys(sample).filter(key =>
+      key.toLowerCase().includes('date') ||
+      key.toLowerCase().includes('time') ||
+      key.toLowerCase().includes('created') ||
+      key.toLowerCase().includes('received') ||
+      key.toLowerCase().includes('sent')
+    );
+
+    dlog(`[${reqId}] ${type} sample date fields:`, {
+      availableFields: dateFields,
+      sampleValues: dateFields.reduce((acc, field) => {
+        acc[field] = sample[field];
+        return acc;
+      }, {}),
+      allFields: Object.keys(sample).slice(0, 10)
+    });
+  }
+}
+
+function extractDate(item, type) {
+  const dateFields =
+    type === 'note'
+      ? [
+          'createdDate','created','date','dateCreated','createDate',
+          'timestamp','createdAt','dateTime','noteDate','updatedDate'
+        ]
+      : type === 'email'
+      ? [
+          'dateReceived','dateSent','createdDate','created','date',
+          'dateCreated','createDate','timestamp','createdAt','dateTime',
+          'receivedDate','sentDate','emailDate','updatedDate'
+        ]
+      : [
+          'createdDate','created','date','dateCreated','createDate',
+          'timestamp','createdAt','dateTime','commentDate','updatedDate'
+        ];
+
+  for (const field of dateFields) {
+    const value = item?.[field];
+    if (value) {
+      const parsed = new Date(value);
+      if (!isNaN(parsed.getTime())) return value;
+    }
+  }
+  console.warn(`No valid date found for ${type}:`, Object.keys(item || {}));
+  return new Date().toISOString();
+}
+
+function fmt(d) {
+  if (!d) return 'No Date';
+  try {
+    const date = new Date(d);
+    if (isNaN(date.getTime())) {
+      console.warn('Invalid date value:', d);
+      return 'Invalid Date';
+    }
+    return date.toLocaleString('en-US', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    });
+  } catch (err) {
+    console.warn('Date formatting error:', err.message, 'for value:', d);
+    return 'Date Error';
+  }
+}
+
+function stripHtml(html) {
+  if (!html) return '';
+  return String(html)
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<[^>]*>/g, '')
+    .replace(/\s+\n/g, '\n')
     .replace(/[ \t]+/g, ' ')
     .trim();
 }
-function hashFingerprint(s) {
-  return crypto.createHash('sha1').update(s).digest('hex');
-}
-function stable(val) {
-  return val == null ? '' : String(val).trim().toLowerCase();
-}
-function byChronAsc(a, b) {
-  return (a.when?.getTime?.() ?? 0) - (b.when?.getTime?.() ?? 0);
-}
-function ensureArray(x) {
-  if (!x) return [];
-  return Array.isArray(x) ? x : [x];
-}
 
-/* ------------------------------ HTTP Wrapper ------------------------------ */
-
-async function http(method, url, { headers = {}, json, form, rawBody, expect = 200 } = {}) {
-  const opts = { method, headers: { ...headers } };
-  if (json != null) {
-    opts.headers['content-type'] = 'application/json';
-    opts.body = JSON.stringify(json);
-  } else if (form != null) {
-    opts.headers['content-type'] = 'application/x-www-form-urlencoded';
-    opts.body = new URLSearchParams(form).toString();
-  } else if (rawBody != null) {
-    opts.body = rawBody;
-  }
-  const res = await fetch(url, opts);
-  if (expect != null && res.status !== expect) {
-    const snippet = await res.text().catch(() => '');
-    throw Object.assign(new Error(`${method} ${url} => ${res.status}`), {
-      status: res.status,
-      snippet: snippet?.slice(0, 200),
-    });
-  }
-  const ctype = res.headers.get('content-type') || '';
-  if (ctype.includes('application/json')) return res.json();
-  return res.text();
-}
-
-/* ---------------------------- Auth & Org Lookup --------------------------- */
-
-async function getAccessToken() {
-  if (CONFIG.accessToken) {
-    log('debug', 'Using provided bearer token (skip exchange)', {
-      tokenLen: CONFIG.accessToken.length,
-    });
-    return CONFIG.accessToken;
-  }
-  const url = `${CONFIG.identityBase}/connect/token`;
-  log('debug', 'POST ' + url + ' (token exchange)');
-  const body = await http('POST', url, {
-    form: {
-      grant_type: 'client_credentials',
-      client_id: CONFIG.clientId,
-      client_secret: CONFIG.clientSecret,
-      scope: CONFIG.scope,
-    },
-  });
-  log('debug', 'Identity response', { status: 200 });
-  log('debug', 'identity JSON preview', jsonPreview(body));
-  const token = body?.access_token;
-  if (!token) throw new Error('No access_token in token exchange response');
-  log('debug', 'Token acquired (length)', { accessTokenLength: token.length });
-  return token;
-}
-
-async function getUserOrg(token) {
-  const url = `${CONFIG.apiBase}${CONFIG.v2Base}/utils/GetUserOrgsWithToken`;
-  log('debug', 'POST ' + url + ' (utils)');
-  const body = await http('POST', url, {
-    headers: { authorization: `Bearer ${token}` },
-  });
-  log('debug', 'GetUserOrgsWithToken response', { status: 200 });
-  log('debug', 'getUserOrgsWithToken JSON preview', {
-    user: '{object keys=' + Object.keys(body?.user || {}).length + '}',
-    orgs: '[array len=' + (body?.orgs?.length || 0) + ']',
-  });
-  const userId = body?.user?.userId?.native ?? body?.user?.id;
-  const orgId = body?.orgs?.[0]?.orgId?.native ?? body?.orgs?.[0]?.id;
-  if (!userId || !orgId) throw new Error('Unable to resolve userId/orgId');
-  log('debug', 'Resolved IDs', { userId, orgId, keys: Object.keys(body) });
-  return { userId, orgId };
-}
-
-/* ------------------------------ API Functions ----------------------------- */
-
-async function getPaged(token, userId, orgId, url, label) {
-  let offset = 0;
-  const limit = 50;
-  const headers = {
-    authorization: `Bearer ${token}`,
-    'x-fv-userid': String(userId),
-    'x-fv-orgid': String(orgId),
-  };
-  const items = [];
-  let hasMore = true;
-  while (hasMore) {
-    const pageUrl = `${url}?limit=${limit}&offset=${offset}`;
-    log('debug', `GET ${pageUrl} (${label})`, { offset, limit, strategy: `GET ${label}` });
-    const page = await http('GET', pageUrl, { headers });
-    log('debug', `${label} page response`, { status: 200, offset, strategy: `GET ${label}` });
-    log('debug', `${label}-page(GET ${label}) JSON preview`, jsonPreview(page));
-    const pageItems = page?.items || [];
-    items.push(...pageItems);
-    hasMore = Boolean(page?.hasMore) || pageItems.length === limit;
-    log('debug', `${label} page parsed`, {
-      itemsReceived: pageItems.length,
-      totalAccumulated: items.length,
-      hasMore,
-      strategy: `GET ${label}`,
-    });
-    if (hasMore) offset += limit;
-  }
-  log('debug', `${label} using strategy`, { strategy: `GET ${label}`, total: items.length });
-  return items;
-}
-
-async function getProjectNotesAndEmails(token, userId, orgId, projectId) {
-  const base = `${CONFIG.apiBase}${CONFIG.v2Base}`;
-  const [notes, emails] = await Promise.all([
-    getPaged(token, userId, orgId, `${base}/projects/${projectId}/notes`, 'notes'),
-    getPaged(token, userId, orgId, `${base}/projects/${projectId}/emails`, 'emails'),
-  ]);
-  log('debug', 'Fetch complete', {
-    notesCount: notes.length,
-    emailsCount: emails.length,
-  });
-  return { notes, emails };
-}
-
-async function getNoteComments(token, userId, orgId, noteId) {
-  const headers = {
-    authorization: `Bearer ${token}`,
-    'x-fv-userid': String(userId),
-    'x-fv-orgid': String(orgId),
-  };
-  const link1 = `${CONFIG.apiBase}/notes/${noteId}/comments?limit=50&offset=0`; // legacy
-  const link2 = `${CONFIG.apiBase}${CONFIG.v2Base}/notes/${noteId}/comments?limit=50&offset=0`; // v2
-  // 1) Try legacy link (may 404 for some tenants/routes)
+function toAbsoluteUrl(pathOrUrl) {
+  // If Filevine returns a relative HAL link (e.g., "/users/{id}"), make it absolute.
   try {
-    log('debug', `GET ${link1} (comments[note:${noteId}])`, {
-      offset: 0,
-      limit: 50,
-      strategy: 'GET link:comments',
-      headers: { 'x-fv-userid': String(userId), 'x-fv-orgid': String(orgId) },
-    });
-    const page = await http('GET', link1, { headers, expect: 200 });
-    log('debug', `comments[note:${noteId}] page response`, {
-      status: 200,
-      offset: 0,
-      strategy: 'GET link:comments',
-    });
-    log('debug', `comments[note:${noteId}]-page(GET link:comments) JSON preview`, jsonPreview(page));
-    const out = page?.items || [];
-    log('debug', `comments[note:${noteId}] page parsed`, {
-      itemsReceived: out.length,
-      totalAccumulated: out.length,
-      hasMore: false,
-      strategy: 'GET link:comments',
-    });
-    return out;
-  } catch (e) {
-    log('debug', `comments[note:${noteId}] page response`, {
-      status: e?.status || 'ERR',
-      offset: 0,
-      strategy: 'GET link:comments',
-    });
-    log('debug', `comments[note:${noteId}]-page(GET link:comments) error body`, {
-      snippet: e?.snippet || '',
-    });
-    log('debug', 'comments explicit link failed', {
-      url: `/notes/${noteId}/comments`,
-      abs: link1,
-      error: `/notes/${noteId}/comments GET error: ${e?.status || 'ERR'}`,
-    });
-  }
-  // 2) Fallback to v2 route
-  log('debug', `GET ${link2} (comments[note:${noteId}])`, {
-    offset: 0,
-    limit: 50,
-    strategy: 'GET /notes/{id}/comments',
-    headers: { 'x-fv-userid': String(userId), 'x-fv-orgid': String(orgId) },
-  });
-  const page2 = await http('GET', link2, { headers, expect: 200 });
-  log('debug', `comments[note:${noteId}] page response`, {
-    status: 200,
-    offset: 0,
-    strategy: 'GET /notes/{id}/comments',
-  });
-  log('debug', `comments[note:${noteId}]-page(GET /notes/{id}/comments) JSON preview`, jsonPreview(page2));
-  const out2 = page2?.items || [];
-  log('debug', `comments[note:${noteId}] page parsed`, {
-    itemsReceived: out2.length,
-    totalAccumulated: out2.length,
-    hasMore: false,
-    strategy: 'GET /notes/{id}/comments',
-  });
-  // IMPORTANT: Do NOT mark as failure if 0 items; that means "no comments".
-  return out2;
-}
-
-function createLimiter(concurrency = 6) {
-  const queue = [];
-  let active = 0;
-  const next = () => {
-    if (active >= concurrency || queue.length === 0) return;
-    active++;
-    const { fn, resolve, reject } = queue.shift();
-    Promise.resolve()
-      .then(fn)
-      .then((v) => resolve(v))
-      .catch((e) => reject(e))
-      .finally(() => {
-        active--;
-        next();
-      });
-  };
-  return function limit(fn) {
-    return new Promise((resolve, reject) => {
-      queue.push({ fn, resolve, reject });
-      next();
-    });
-  };
-}
-
-const userCache = new Map();
-async function resolveUser(token, userId, orgId, id) {
-  if (!id) return null;
-  const key = String(id);
-  if (userCache.has(key)) return userCache.get(key);
-  const url = `${CONFIG.apiBase}${CONFIG.v2Base}/users/${id}`;
-  const headers = {
-    authorization: `Bearer ${token}`,
-    'x-fv-userid': String(userId),
-    'x-fv-orgid': String(orgId),
-  };
-  try {
-    const body = await http('GET', url, { headers, expect: 200 });
-    const name =
-      body?.displayName ||
-      [body?.firstName, body?.lastName].filter(Boolean).join(' ') ||
-      body?.username ||
-      String(id);
-    userCache.set(key, name);
-    return name;
+    return new URL(pathOrUrl, GATEWAY_REGION_BASE).toString();
   } catch {
-    userCache.set(key, String(id));
-    return String(id);
+    return String(pathOrUrl || '');
   }
 }
 
-/* -------------------------- Transformation / Merge ------------------------ */
+async function getBearerToken(reqId) {
+  const client_id = process.env.FILEVINE_CLIENT_ID;
+  const client_secret = process.env.FILEVINE_CLIENT_SECRET;
+  const pat_token = process.env.FILEVINE_PAT_TOKEN;
+  if (!client_id || !client_secret || !pat_token) throw new Error('Missing Filevine credentials in env vars');
 
-function extractNoteCore(n) {
-  const text =
-    n?.text?.text ??
-    n?.text ??
-    n?.body?.text ??
-    n?.body ??
-    n?.content?.text ??
-    n?.content ??
-    '';
-  // Timestamps: prefer createdDate, fallback updated/posted
-  const when =
-    toDate(n?.createdDate) ||
-    toDate(n?.createDate) ||
-    toDate(n?.postDate) ||
-    toDate(n?.dateCreated) ||
-    toDate(n?.date);
-  const createdById = n?.createdById?.native ?? n?.createdById ?? n?.createdBy?.id?.native;
-  return {
-    id: String(n?.id?.native ?? n?.id ?? ''),
-    kind: 'Note',
-    text: normText(text),
-    when,
-    createdById,
-  };
-}
-function extractEmailCore(e) {
-  const subject = e?.subject ?? '';
-  const body =
-    e?.body?.html ||
-    e?.body?.text ||
-    e?.body ||
-    e?.message?.body?.text ||
-    e?.message?.body ||
-    '';
-  const when =
-    toDate(e?.sentDate) ||
-    toDate(e?.date) ||
-    toDate(e?.createdDate) ||
-    toDate(e?.receivedDate);
-  const from =
-    e?.from?.displayName ||
-    e?.from?.name ||
-    e?.from?.email ||
-    e?.sender?.email ||
-    e?.sender ||
-    '';
-  const to = ensureArray(e?.to)
-    .map((x) => x?.email || x?.displayName || x?.name || x)
-    .filter(Boolean);
-  const cc = ensureArray(e?.cc)
-    .map((x) => x?.email || x?.displayName || x?.name || x)
-    .filter(Boolean);
-  return {
-    id: String(e?.id?.native ?? e?.id ?? ''),
-    kind: 'Email',
-    subject: normText(subject),
-    body: normText(body),
-    when,
-    from: normText(from),
-    to: to.map(normText),
-    cc: cc.map(normText),
-  };
-}
+  const body = new URLSearchParams();
+  body.set('grant_type', 'personal_access_token');
+  body.set('scope', 'fv.api.gateway.access tenant filevine.v2.api.* openid email fv.auth.tenant.read');
+  body.set('token', pat_token);
+  body.set('client_id', client_id);
+  body.set('client_secret', client_secret);
 
-// Build a cross-type fingerprint to collapse Note<->Email duplicates present in Filevine.
-function buildFingerprint(item) {
-  if (item.kind === 'Email') {
-    const dt = Math.floor((item.when?.getTime?.() ?? 0) / (60 * 1000)); // minute
-    const norm = [
-      'email',
-      stable(item.subject),
-      stable(item.from),
-      stable(item.to?.join(',')),
-      stable(item.cc?.join(',')),
-      stable(item.body).slice(0, 4000),
-      dt,
-    ].join('|');
-    return hashFingerprint(norm);
+  dlog(`[${reqId}] POST ${IDENTITY_URL} (token exchange)`);
+  const resp = await fetch(IDENTITY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+    body
+  });
+  dlog(`[${reqId}] Identity response`, { status: resp.status });
+  if (!resp.ok) {
+    await logErrorBody(resp, reqId, 'identity');
+    throw new Error(`Identity token error: ${resp.status}`);
   }
-  // Note — try to detect emails saved as notes (subject line + email body)
-  const firstLine = stable(item.text.split('\n')[0] || '');
-  const bodyFrag = stable(item.text).slice(0, 4000);
-  const dt = Math.floor((item.when?.getTime?.() ?? 0) / (60 * 1000));
-  const norm = ['note', firstLine, bodyFrag, dt].join('|');
-  return hashFingerprint(norm);
+  const data = await safeJson(resp, reqId, 'identity');
+  if (!data.access_token) throw new Error('No access_token in identity response');
+  dlog(`[${reqId}] Token acquired (length)`, { accessTokenLength: String(data.access_token).length });
+  return data.access_token; // never log token value
 }
 
-function dedupe(items) {
-  const out = [];
-  const seen = new Map();
-  for (const it of items) {
-    const fp = buildFingerprint(it);
-    // If a duplicate exists, prefer Email over Note (emails typically have more header context).
-    if (seen.has(fp)) {
-      const idx = seen.get(fp);
-      const existing = out[idx];
-      if (existing && existing.kind === 'Note' && it.kind === 'Email') {
-        out[idx] = it;
-      }
+async function getUserAndOrgIds(bearer, reqId) {
+  const url = `${GATEWAY_UTILS_BASE}/utils/GetUserOrgsWithToken`;
+  dlog(`[${reqId}] POST ${url} (utils)`);
+  const resp = await fetchWithRetry(url, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${bearer}`, 'Accept': 'application/json' }
+  }, reqId);
+  dlog(`[${reqId}] GetUserOrgsWithToken response`, { status: resp.status });
+  if (!resp.ok) {
+    await logErrorBody(resp, reqId, 'GetUserOrgsWithToken');
+    throw new Error(`GetUserOrgsWithToken error: ${resp.status}`);
+  }
+  const data = await safeJson(resp, reqId, 'getUserOrgsWithToken');
+
+  const userId = pickUserId(data);
+  const orgId  = pickOrgId(data);
+
+  dlog(`[${reqId}] Resolved IDs`, { userId, orgId, keys: Object.keys(data || {}) });
+  if (!userId || !orgId) throw new Error('Could not resolve userId/orgId from gateway response');
+  return { userId: String(userId), orgId: String(orgId) };
+}
+
+function pickUserId(data) {
+  const candidates = [
+    data?.userId,
+    data?.user,
+    data?.user?.id,
+    data?.user?.userId,
+    data?.user?.native
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'number' || typeof c === 'string') return c;
+    if (c && typeof c === 'object' && (typeof c.native === 'number' || typeof c.native === 'string')) return c.native;
+  }
+  return null;
+}
+
+function pickOrgId(data) {
+  const candidates = [
+    data?.orgId,
+    data?.org,
+    data?.org?.id,
+    data?.orgs?.[0]?.orgId,
+    data?.orgs?.[0]?.id
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'number' || typeof c === 'string') return c;
+    if (c && typeof c === 'object' && (typeof c.id === 'number' || typeof c.id === 'string')) return c.id;
+  }
+  return null;
+}
+
+/**
+ * Try multiple plausible endpoints/methods for "notes" or "emails".
+ * Stops on first 2xx and paginates with the same route.
+ */
+async function pullWithStrategies(kind, projectId, bearer, userId, orgId, reqId) {
+  const limit = 50;
+  const base = `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}`;
+
+  const strategies = kind === 'notes'
+    ? [
+        { label: 'GET notes',              method: 'GET',  url: `${base}/notes` },
+        { label: 'GET activity/notes',     method: 'GET',  url: `${base}/activity/notes` },
+        { label: 'GET activity?types=note',method: 'GET',  url: `${base}/activity`, qp: { types: 'note' } },
+        { label: 'GET notes/list',         method: 'GET',  url: `${base}/notes/list` },
+        { label: 'POST notes',             method: 'POST', url: `${base}/notes`,      body: ({offset, limit}) => ({ offset, limit }) },
+        { label: 'POST notes/list',        method: 'POST', url: `${base}/notes/list`, body: ({offset, limit}) => ({ offset, limit }) },
+      ]
+    : [
+        { label: 'GET emails',              method: 'GET',  url: `${base}/emails` },
+        { label: 'GET activity/emails',     method: 'GET',  url: `${base}/activity/emails` },
+        { label: 'GET activity?types=email',method: 'GET',  url: `${base}/activity`, qp: { types: 'email' } },
+        { label: 'GET emails/list',         method: 'GET',  url: `${base}/emails/list` },
+        { label: 'POST emails',             method: 'POST', url: `${base}/emails`,      body: ({offset, limit}) => ({ offset, limit }) },
+        { label: 'POST emails/list',        method: 'POST', url: `${base}/emails/list`, body: ({offset, limit}) => ({ offset, limit }) },
+      ];
+
+  for (const strat of strategies) {
+    try {
+      const items = await pullAllPagesWithOneRoute(strat, bearer, userId, orgId, limit, reqId, kind);
+      dlog(`[${reqId}] ${kind} using strategy`, { strategy: strat.label, total: items.length });
+      if (items) return items;
+    } catch (e) {
+      dlog(`[${reqId}] ${kind} failed strategy`, { strategy: strat.label, error: e?.message });
       continue;
     }
-    seen.set(fp, out.length);
-    out.push(it);
+  }
+  throw new Error(`No ${kind} route matched; tried ${strategies.map(s => s.label).join(' | ')}`);
+}
+
+/** Pull all pages with a single route (GET query or POST body). */
+async function pullAllPagesWithOneRoute(strat, bearer, userId, orgId, limit, reqId, label) {
+  const out = [];
+  let offset = 0;
+
+  while (true) {
+    const hasBody = typeof strat.body === 'function';
+    let urlObj = new URL(strat.url);
+    const init = {
+      method: strat.method,
+      headers: {
+        'Authorization': `Bearer ${bearer}`,
+        'x-fv-userid': String(userId),
+        'x-fv-orgid': String(orgId),
+        'Accept': 'application/json'
+      }
+    };
+
+    if (strat.method === 'GET') {
+      urlObj.searchParams.set('limit', String(limit));
+      urlObj.searchParams.set('offset', String(offset));
+      if (strat.qp) for (const [k, v] of Object.entries(strat.qp)) urlObj.searchParams.set(k, String(v));
+    } else {
+      init.headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify({ limit, offset, ...(hasBody ? strat.body({ offset, limit }) : {}) });
+    }
+
+    const urlStr = urlObj.toString();
+    dlog(`[${reqId}] ${strat.method} ${urlStr} (${label})`, {
+      offset, limit, strategy: strat.label,
+      headers: { 'x-fv-userid': String(userId), 'x-fv-orgid': String(orgId) }
+    });
+
+    const resp = await fetchWithRetry(urlStr, init, reqId);
+    dlog(`[${reqId}] ${label} page response`, { status: resp.status, offset, strategy: strat.label });
+
+    if (!resp.ok) {
+      await logErrorBody(resp, reqId, `${label}-page(${strat.label})`);
+      throw new Error(`${urlObj.pathname} ${strat.method} error: ${resp.status}`);
+    }
+
+    const data = await safeJson(resp, reqId, `${label}-page(${strat.label})`);
+    const items = extractItems(data);
+    out.push(...items);
+
+    const hasMore = inferHasMore(data, items, limit, offset);
+    dlog(`[${reqId}] ${label} page parsed`, {
+      itemsReceived: items.length,
+      totalAccumulated: out.length,
+      hasMore,
+      strategy: strat.label
+    });
+
+    if (!hasMore) break;
+    offset += limit;
   }
   return out;
 }
 
-/* ---------------------------------- PDF ----------------------------------- */
+function extractItems(data) {
+  if (!data) return [];
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data.items)) return data.items;
+  if (Array.isArray(data.results)) return data.results;
+  if (Array.isArray(data.data)) return data.data;
+  if (Array.isArray(data.activityItems)) return data.activityItems;
+  if (data.page && Array.isArray(data.page.items)) return data.page.items;
+  if (Array.isArray(data.comments)) return data.comments;
+  return [];
+}
 
-function renderTextWithLinks(doc, text, opts = {}) {
-  // Detect http(s):// or mailto: sequences, link them, but keep wrapping sane.
-  const parts = String(text).split(
-    /((?:https?:\/\/|mailto:)[^\s<>()\[\]{}"]+[^\s<>()\[\]{}"'.;,!?])/gi
-  );
-  parts.forEach((part, i) => {
-    if (!part) return;
-    const isLink = i % 2 === 1;
-    if (isLink) {
-      doc.fillColor('black').text(part, { link: part, underline: false, ...opts });
-    } else {
-      doc.fillColor('black').text(part, { continued: false, ...opts });
+function inferHasMore(data, items, limit, _offset) {
+  if (data?.hasMore === true) return true;
+  if (typeof data?.hasMore === 'string' && data.hasMore.toLowerCase() === 'true') return true;
+  if (data?.nextOffset != null) return true;
+  return items.length === limit;
+}
+
+/** Retry + logging for transient errors. */
+async function fetchWithRetry(input, init = {}, reqId, retries = 2, delayMs = 250) {
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    try {
+      const resp = await fetch(input, init);
+      if (resp.status >= 500 && retries > 0) {
+        dlog(`[${reqId}] fetchWithRetry 5xx`, { url: input, status: resp.status, attempt });
+        await sleep(delayMs * attempt);
+        retries--;
+        continue;
+      }
+      return resp;
+    } catch (err) {
+      if (retries > 0) {
+        dlog(`[${reqId}] fetchWithRetry network error`, { url: input, attempt, message: err?.message });
+        await sleep(delayMs * attempt);
+        retries--;
+        continue;
+      }
+      throw err;
     }
+  }
+}
+
+async function safeJson(resp, reqId, tag) {
+  try {
+    const text = await resp.text();
+    try {
+      const json = JSON.parse(text);
+      dlog(`[${reqId}] ${tag} JSON preview`, previewJson(json));
+      return json;
+    } catch {
+      dlog(`[${reqId}] ${tag} non-JSON body`, { snippet: text.slice(0, 300) });
+      return {};
+    }
+  } catch (err) {
+    dlog(`[${reqId}] ${tag} body read error`, { message: err?.message });
+    return {};
+  }
+}
+
+async function logErrorBody(resp, reqId, tag) {
+  try {
+    const clone = resp.clone?.() ?? resp;
+    const text = await clone.text();
+    dlog(`[${reqId}] ${tag} error body`, { snippet: text.slice(0, 600) });
+  } catch (err) {
+    dlog(`[${reqId}] ${tag} error body read failed`, { message: err?.message });
+  }
+}
+
+function previewJson(obj, maxKeys = 20) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const keys = Object.keys(obj).slice(0, maxKeys);
+  const preview = {};
+  for (const k of keys) {
+    const v = obj[k];
+    preview[k] = (k.toLowerCase().includes('token') || k.toLowerCase().includes('secret'))
+      ? '[redacted]'
+      : summarize(v);
+  }
+  return preview;
+}
+
+function summarize(v) {
+  if (v == null) return v;
+  if (Array.isArray(v)) return `[array len=${v.length}]`;
+  if (typeof v === 'object') return `{object keys=${Object.keys(v).length}}`;
+  const s = String(v);
+  return s.length > 160 ? s.slice(0, 160) + '…' : s;
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/* ---------- comments helpers & flow ---------- */
+
+function extractEmbeddedComments(note) {
+  const arrays = [
+    note?.comments,
+    note?.replies,
+    note?.commentItems,
+    note?.noteComments,
+    note?.thread?.comments,
+    note?.page?.items
+  ];
+  const found = arrays.find(a => Array.isArray(a)) || [];
+  return found.map(c => ({
+    id: normalizeId(c?.id ?? c?.commentId),
+    created: extractDate(c, 'comment'),
+    author: extractAuthor(c),
+    body: c?.body || c?.text || c?.content || ''
+  }));
+}
+
+function commentsLinkFromNote(note) {
+  const candidate =
+    note?._links?.comments?.href ||
+    note?._links?.comments ||
+    note?.links?.comments?.href ||
+    note?.links?.comments ||
+    null;
+  return candidate ? String(candidate) : null;
+}
+
+async function attachCommentsToNotes({ notes, projectId, token, userId, orgId, reqId }) {
+  if (!Array.isArray(notes) || !notes.length) return [];
+
+  dlog(`[${reqId}] Attaching comments to ${notes.length} notes`);
+  const MAX_CONCURRENCY = 4;
+  const queue = notes.slice();
+  const results = [];
+  let active = 0;
+
+  return await new Promise((resolve) => {
+    const runNext = async () => {
+      if (!queue.length && active === 0) return resolve(results);
+      while (active < MAX_CONCURRENCY && queue.length) {
+        const note = queue.shift();
+        active++;
+        (async () => {
+          try {
+            const noteId = normalizeId(note?.id ?? note?.noteId);
+            const pre = extractEmbeddedComments(note);
+            if (pre.length) {
+              results.push({ ...note, comments: pre });
+            } else if (!noteId) {
+              dlog(`[${reqId}] No usable noteId; skipping comment fetch`);
+              results.push({ ...note, comments: [] });
+            } else {
+              const link = commentsLinkFromNote(note);
+              const comments = await getNoteComments({
+                projectId,
+                noteId,
+                explicitUrl: link,
+                bearer: token,
+                userId,
+                orgId,
+                reqId
+              });
+              results.push({ ...note, comments });
+            }
+          } catch (err) {
+            dlog(`[${reqId}] comments fetch failed`, { error: err?.message });
+            results.push({ ...note, comments: [] });
+          } finally {
+            active--;
+            runNext();
+          }
+        })();
+      }
+    };
+    runNext();
   });
 }
 
-function writeHeadingLine(doc, type, when, rightText = '') {
-  doc.moveDown(0.5);
-  doc
-    .fontSize(CONFIG.h2FontSize)
-    .font('Helvetica-Bold')
-    .fillColor('black')
-    .text(`${type} • ${fmtDate(when)}` + (rightText ? `   ${rightText}` : ''));
-  doc.moveDown(0.25);
+async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId, orgId, reqId }) {
+  const limit = 50;
+  const nid  = encodeURIComponent(String(noteId));
+
+  // 1) Try explicit per-item HAL link first (often "/notes/{id}/comments")
+  if (explicitUrl) {
+    const abs = toAbsoluteUrl(explicitUrl);
+    try {
+      const items = await pullAllPagesWithOneRoute(
+        { label: 'GET link:comments', method: 'GET', url: abs },
+        bearer, userId, orgId, limit, reqId, `comments[note:${noteId}]`
+      );
+      if (Array.isArray(items) && items.length) return normalizeComments(items);
+    } catch (e) {
+      dlog(`[${reqId}] comments explicit link failed`, { url: explicitUrl, abs, error: e?.message });
+    }
+  }
+
+  // 2) Fallback: global notes resource (NOT project-scoped) → /notes/{noteId}/comments
+  const strategies = [
+    { label: 'GET /notes/{id}/comments', method: 'GET', url: `${GATEWAY_REGION_BASE}/notes/${nid}/comments` }
+  ];
+
+  for (const strat of strategies) {
+    try {
+      const items = await pullAllPagesWithOneRoute(
+        strat, bearer, userId, orgId, limit, reqId, `comments[note:${noteId}]`
+      );
+      if (Array.isArray(items) && items.length) return normalizeComments(items);
+    } catch (e) {
+      dlog(`[${reqId}] comments failed strategy`, { noteId, strategy: strat.label, error: e?.message });
+    }
+  }
+
+  dlog(`[${reqId}] All comment strategies failed for note`, { noteId });
+  return [];
 }
 
-function writeKeyVal(doc, key, val) {
-  if (!val) return;
-  doc.font('Helvetica-Bold').text(`${key}: `, { continued: true });
-  doc.font('Helvetica').text(val);
+function normalizeComments(items) {
+  return items.map(c => ({
+    id: normalizeId(c?.id ?? c?.commentId),
+    created: extractDate(c, 'comment'),
+    author: extractAuthor(c),
+    body: c?.body || c?.text || c?.content || ''
+  }));
 }
 
-function maybeTruncate(s) {
-  if (!CONFIG.softLimitBodyChars || !s) return s;
-  if (s.length <= CONFIG.softLimitBodyChars) return s;
-  return s.slice(0, CONFIG.softLimitBodyChars) + ' …[truncated]';
+/* ---------- author enrichment ---------- */
+
+function createdByLinkFromNote(note) {
+  return (
+    (note?._links?.createdBy?.href || note?._links?.createdBy) ||
+    (note?.links?.createdBy?.href   || note?.links?.createdBy) ||
+    null
+  ) ? String((note?._links?.createdBy?.href || note?._links?.createdBy || note?.links?.createdBy?.href || note?.links?.createdBy)) : null;
 }
 
-async function renderPdf(projectId, items, outPath, generatedAt) {
-  const doc = new PDFDocument({
-    size: CONFIG.pageSize,
-    margins: { top: CONFIG.margin, left: CONFIG.margin, right: CONFIG.margin, bottom: CONFIG.margin },
-    bufferPages: true,
-    autoFirstPage: true,
-    info: {
-      Title: `Project ${projectId} — Notes & Emails`,
-      Author: 'Filevine Export',
-    },
+/**
+ * For notes whose author name isn't obvious, try to resolve it by:
+ *  1) Following the HAL createdBy link (GET that URL, cache it, pick a name)
+ *  2) Matching against _embedded.users (if present) by creator id
+ */
+async function enrichNoteAuthors(notes, bearer, userId, orgId, reqId) {
+  if (!Array.isArray(notes) || !notes.length) return;
+
+  // Which notes still lack an author name?
+  const unresolved = notes.filter(n => {
+    const already = n?.__author || extractNoteAuthor(n);
+    return !already;
   });
-  const stream = fs.createWriteStream(outPath);
-  doc.pipe(stream);
+  if (!unresolved.length) {
+    dlog(`[${reqId}] author enrichments`, { totalNotes: notes.length, unresolvedBefore: 0, unresolvedAfter: 0 });
+    return;
+  }
 
-  // Title
-  doc.font('Helvetica-Bold').fontSize(CONFIG.titleFontSize).text(`Project ${projectId} — Notes & Emails`);
-  doc.moveDown(0.25);
-  doc.font('Helvetica').fontSize(CONFIG.pdfFontSize).text(`Generated: ${fmtDate(generatedAt)}`);
-  doc.moveDown(0.75);
+  // 1) Follow HAL createdBy links (dedup + cache)
+  const hrefToNotes = new Map();
+  for (const n of unresolved) {
+    const href = createdByLinkFromNote(n);
+    if (href) {
+      const abs = toAbsoluteUrl(href);
+      if (!hrefToNotes.has(abs)) hrefToNotes.set(abs, []);
+      hrefToNotes.get(abs).push(n);
+    }
+  }
 
-  // Body
-  for (const it of items) {
-    if (it.kind === 'Email') {
-      writeHeadingLine(doc, 'Email', it.when, it.subject ? `\n` : '');
-      if (it.subject) {
-        doc.font('Helvetica-Bold').text(it.subject);
+  const entries = Array.from(hrefToNotes.entries());
+  const authorCache = new Map();
+  const MAX_CONCURRENCY = Math.min(6, Math.max(1, entries.length));
+  let idx = 0;
+
+  async function worker() {
+    while (idx < entries.length) {
+      const [abs, bucket] = entries[idx++];
+      try {
+        const init = {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${bearer}`,
+            'x-fv-userid': String(userId),
+            'x-fv-orgid': String(orgId),
+            'Accept': 'application/json'
+          }
+        };
+        dlog(`[${reqId}] GET ${abs} (author-resolve)`);
+        const resp = await fetchWithRetry(abs, init, reqId);
+        dlog(`[${reqId}] author-resolve response`, { status: resp.status });
+        if (!resp.ok) {
+          await logErrorBody(resp, reqId, 'author-resolve');
+          continue;
+        }
+        const data = await safeJson(resp, reqId, 'author-resolve');
+        const name =
+          pickName(data) ||
+          pickName(data?.user) ||
+          pickName(data?.person) ||
+          pickName(data?.profile) ||
+          data?.displayName ||
+          data?.fullName ||
+          data?.name ||
+          '';
+        if (name) {
+          authorCache.set(abs, name);
+          for (const n of bucket) n.__author = name;
+        } else {
+          dlog(`[${reqId}] author-resolve no usable name`, { keys: Object.keys(data || {}) });
+        }
+      } catch (e) {
+        dlog(`[${reqId}] author-resolve failed`, { url: abs, error: e?.message });
       }
-      if (it.from || (it.to?.length || 0) || (it.cc?.length || 0)) {
-        writeKeyVal(doc, 'From', it.from);
-        writeKeyVal(doc, 'To', it.to?.join(', '));
-        writeKeyVal(doc, 'Cc', it.cc?.join(', '));
-      }
-      doc.moveDown(0.25);
-      const body = maybeTruncate(it.body);
-      if (body) renderTextWithLinks(doc, body);
-    } else {
-      // Note
-      writeHeadingLine(doc, 'Note', it.when, it.createdByName ? `\n` : '');
-      if (it.createdByName) writeKeyVal(doc, 'Author', it.createdByName);
-      const body = maybeTruncate(it.text);
-      if (body) renderTextWithLinks(doc, body);
-      if ((it.comments?.length || 0) > 0) {
-        doc.moveDown(0.15);
-        doc.font('Helvetica-Bold').text(`Comments (${it.comments.length}):`);
-        doc.moveDown(0.15);
-        for (const c of it.comments) {
-          const line = `${fmtDate(toDate(c?.createdDate || c?.date || c?.timestamp))}\n${normText(
-            c?.text?.text || c?.text || c?.body?.text || c?.body || ''
-          )}`;
-          renderTextWithLinks(doc, maybeTruncate(line));
-          doc.moveDown(0.15);
+    }
+  }
+  await Promise.all(Array.from({ length: MAX_CONCURRENCY }, () => worker()));
+
+  // 2) Embedded users matching by id (for any still unresolved)
+  for (const n of unresolved) {
+    if (n.__author) continue;
+    const idCandidates = collectAuthorIdCandidates(n);
+    const users = n?._embedded?.users || n?.embedded?.users;
+    if (Array.isArray(users) && idCandidates.length) {
+      for (const u of users) {
+        const uid = String(u?.id ?? u?.userId ?? u?.native ?? '');
+        if (uid && idCandidates.includes(uid)) {
+          const nm = pickName(u);
+          if (nm) { n.__author = nm; break; }
         }
       }
     }
-    doc.moveDown(0.6);
-    // Add a soft rule
-    const x = doc.x;
-    const y = doc.y;
-    doc
-      .moveTo(x, y)
-      .lineTo(doc.page.width - doc.page.margins.right, y)
-      .strokeColor('#bbbbbb')
-      .lineWidth(0.5)
-      .stroke();
-    doc.moveDown(0.4);
   }
 
-  doc.end();
-  await new Promise((res, rej) => {
-    stream.on('finish', res);
-    stream.on('error', rej);
+  const still = notes.filter(n => !(n.__author || extractNoteAuthor(n))).length;
+  dlog(`[${reqId}] author enrichments`, {
+    totalNotes: notes.length,
+    unresolvedBefore: unresolved.length,
+    unresolvedAfter: still,
+    halLinksFollowed: entries.length
   });
 }
-
-/* --------------------------------- Main ----------------------------------- */
-
-async function main() {
-  const projectId = process.env.FILEVINE_PROJECT_ID || process.argv[2];
-  if (!projectId) {
-    console.error('Usage: node generate-notes-emails-pdf.mjs <projectId>');
-    process.exit(1);
-  }
-
-  log('debug', 'Start', {
-    utilsBase: `${CONFIG.apiBase}${CONFIG.v2Base}`,
-    regionBase: `${CONFIG.apiBase}${CONFIG.v2Base}`,
-    projectId: String(projectId),
-  });
-
-  const token = await getAccessToken();
-  const { userId, orgId } = await getUserOrg(token);
-
-  const headers = { 'x-fv-userid': String(userId), 'x-fv-orgid': String(orgId) };
-  log('debug', 'Using gateway headers', headers);
-
-  const { notes, emails } = await getProjectNotesAndEmails(token, userId, orgId, projectId);
-
-  // Attach comments (with concurrency limit)
-  log('debug', `Attaching comments to ${notes.length} notes`);
-  const limit = createLimiter(10);
-  const noteComments = await Promise.all(
-    notes.map((n) =>
-      limit(async () => {
-        const id = String(n?.id?.native ?? n?.id ?? '');
-        try {
-          const comments = await getNoteComments(token, userId, orgId, id);
-          return { id, comments, ok: true };
-        } catch (e) {
-          // Only log as failed if both strategies errored. Here, the catch should be rare.
-          log('debug', `All comment strategies failed for note`, { noteId: id, error: String(e?.message || e) });
-          return { id, comments: [], ok: false };
-        }
-      })
-    )
-  );
-  const commentMap = new Map(noteComments.map((r) => [r.id, r.comments || []]));
-
-  // Transform items
-  const transformedNotes = await Promise.all(
-    notes.map(async (n) => {
-      const base = extractNoteCore(n);
-      const createdByName = await resolveUser(token, userId, orgId, base.createdById);
-      return {
-        ...base,
-        createdByName,
-        comments: commentMap.get(base.id) || [],
-      };
-    })
-  );
-
-  const transformedEmails = emails.map(extractEmailCore);
-
-  // Merge + de-dup + sort
-  const allItems = dedupe([...transformedNotes, ...transformedEmails]).sort(byChronAsc);
-
-  // Render PDF
-  const datePart = new Date().toISOString().slice(0, 10);
-  const outName = `project-${projectId}-notes-emails-${datePart}.pdf`;
-  const outPath = path.join(CONFIG.outputDir, outName);
-  await renderPdf(projectId, allItems, outPath, new Date());
-
-  log('debug', 'Export complete', { outPath });
-  console.log(`\n✅ Wrote: ${outPath}\n`);
-}
-
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
