@@ -1,23 +1,21 @@
 import PDFDocument from 'pdfkit';
 
 /**
- * Environment variables (Vercel → Project → Settings → Environment Variables)
+ * Env (Vercel → Settings → Environment Variables)
  *  - FILEVINE_CLIENT_ID
  *  - FILEVINE_CLIENT_SECRET
  *  - FILEVINE_PAT_TOKEN
  *  - DEBUG           (optional: "true" | "false"; default: "true")
  *
  * Notes:
- * - US ONLY (no Canada). Project resources use /fv-app/v2-us on the GLOBAL API host.
- * - Utils endpoint (GetUserOrgsWithToken) must use the GLOBAL host /fv-app/v2 (not the tenant subdomain).
+ * - US region only.
+ * - Use GLOBAL hosts (api.filevineapp.com) for gateway calls.
+ * - Per Filevine’s gateway instructions, send x-fv-userid and x-fv-orgid on all API calls after token exchange. 
  */
 
 const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
-
-// GLOBAL API hosts (required for stable routing)
-const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2';     // non-regional (utils)
-const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2-us';  // US regional (projects)
-
+const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2';     // non-regional
+const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2-us';  // US regional
 const DEBUG = (process.env.DEBUG ?? 'true').toLowerCase() !== 'false';
 
 const REQ = () => Math.random().toString(36).slice(2, 10);
@@ -39,18 +37,17 @@ export default async function handler(req, res) {
       projectId
     });
 
-    // 1) Exchange PAT for bearer token
+    // 1) Token
     const token = await getBearerToken(reqId);
 
-    // 2) Resolve User ID and Org ID (non-regional utils base on GLOBAL host)
+    // 2) Resolve user/org (non-regional)
     const { userId, orgId } = await getUserAndOrgIds(token, reqId);
 
-    // 3) Pull notes + emails from regional base (GLOBAL host) with pagination
+    // 3) Pull notes & emails using multi-strategy fallbacks
     const [notes, emails] = await Promise.all([
-      pullAllPages(`${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/notes`, token, userId, orgId, reqId, 'notes'),
-      pullAllPages(`${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/emails`, token, userId, orgId, reqId, 'emails')
+      pullWithStrategies('notes', projectId, token, userId, orgId, reqId),
+      pullWithStrategies('emails', projectId, token, userId, orgId, reqId)
     ]);
-
     dlog(`[${reqId}] Fetch complete`, { notesCount: notes.length, emailsCount: emails.length });
 
     // 4) Normalize + merge chronologically
@@ -75,7 +72,7 @@ export default async function handler(req, res) {
 
     dlog(`[${reqId}] Merge complete`, { mergedCount: merged.length });
 
-    // 5) Stream a PDF
+    // 5) PDF stream
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Cache-Control', 'no-store');
 
@@ -96,16 +93,14 @@ export default async function handler(req, res) {
         doc
           .fontSize(12)
           .fillColor('#000')
-          .text(`${item.type} • ${fmt(item.created)}${item.author ? ` • ${item.author}` : ''}`, { continued: false });
+          .text(`${item.type} • ${fmt(item.created)}${item.author ? ` • ${item.author}` : ''}`);
         if (item.title) {
           doc.font('Helvetica-Bold').text(item.title);
           doc.font('Helvetica');
         }
         if (item.body) doc.fontSize(11).fillColor('#111').text(stripHtml(item.body), { align: 'left' });
         doc.moveDown(0.25);
-        doc
-          .strokeColor('#ddd')
-          .lineWidth(1)
+        doc.strokeColor('#ddd').lineWidth(1)
           .moveTo(doc.page.margins.left, doc.y)
           .lineTo(doc.page.width - doc.page.margins.right, doc.y)
           .stroke();
@@ -182,9 +177,10 @@ async function getUserAndOrgIds(bearer, reqId) {
     await logErrorBody(resp, reqId, 'GetUserOrgsWithToken');
     throw new Error(`GetUserOrgsWithToken error: ${resp.status}`);
   }
-
   const data = await safeJson(resp, reqId, 'getUserOrgsWithToken');
-  const userId = data?.userId || data?.user?.id || data?.user?.userId;
+
+  // observed structure (example): { user: { native: 123 }, orgs: [{ id: ... }, ...] }
+  const userId = data?.userId || data?.user?.id || data?.user?.userId || data?.user?.native;
   const orgId  = data?.orgId  || data?.org?.id  || data?.orgs?.[0]?.orgId || data?.orgs?.[0]?.id;
 
   dlog(`[${reqId}] Resolved IDs`, { userId, orgId, keys: Object.keys(data || {}) });
@@ -192,38 +188,118 @@ async function getUserAndOrgIds(bearer, reqId) {
   return { userId, orgId };
 }
 
-async function pullAllPages(baseUrl, bearer, userId, orgId, reqId, label) {
+/**
+ * Try multiple plausible endpoints/methods for "notes" or "emails".
+ * Stops on first 2xx and paginates with the same route.
+ */
+async function pullWithStrategies(kind, projectId, bearer, userId, orgId, reqId) {
+  const limit = 50;
+  const base = `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}`;
+
+  // candidate strategies: url, method, queryParam builder, optional bodyBuilder
+  // We’ll keep GET first (common), then fall back to activity or POST list forms.
+  const strategies = kind === 'notes'
+    ? [
+        // 1) GET /projects/{id}/notes
+        { label: 'GET notes', method: 'GET', url: `${base}/notes` },
+        // 2) GET /projects/{id}/activity/notes
+        { label: 'GET activity/notes', method: 'GET', url: `${base}/activity/notes` },
+        // 3) GET /projects/{id}/activity?types=note
+        { label: 'GET activity?types=note', method: 'GET', url: `${base}/activity`, qp: { types: 'note' } },
+        // 4) GET /projects/{id}/notes/list
+        { label: 'GET notes/list', method: 'GET', url: `${base}/notes/list` },
+        // 5) POST /projects/{id}/notes (body pagination)
+        { label: 'POST notes', method: 'POST', url: `${base}/notes`, body: ({offset, limit}) => ({ offset, limit }) },
+        // 6) POST /projects/{id}/notes/list (body pagination)
+        { label: 'POST notes/list', method: 'POST', url: `${base}/notes/list`, body: ({offset, limit}) => ({ offset, limit }) },
+      ]
+    : [
+        // 1) GET /projects/{id}/emails
+        { label: 'GET emails', method: 'GET', url: `${base}/emails` },
+        // 2) GET /projects/{id}/activity/emails
+        { label: 'GET activity/emails', method: 'GET', url: `${base}/activity/emails` },
+        // 3) GET /projects/{id}/activity?types=email
+        { label: 'GET activity?types=email', method: 'GET', url: `${base}/activity`, qp: { types: 'email' } },
+        // 4) GET /projects/{id}/emails/list
+        { label: 'GET emails/list', method: 'GET', url: `${base}/emails/list` },
+        // 5) POST /projects/{id}/emails (body pagination)
+        { label: 'POST emails', method: 'POST', url: `${base}/emails`, body: ({offset, limit}) => ({ offset, limit }) },
+        // 6) POST /projects/{id}/emails/list (body pagination)
+        { label: 'POST emails/list', method: 'POST', url: `${base}/emails/list`, body: ({offset, limit}) => ({ offset, limit }) },
+      ];
+
+  // attempt each strategy until one works
+  let winner = null;
+  for (const strat of strategies) {
+    try {
+      const page0 = await pullAllPagesWithOneRoute(strat, bearer, userId, orgId, limit, reqId, kind);
+      dlog(`[${reqId}] ${kind} using strategy`, { strategy: strat.label, total: page0.length });
+      if (page0) {
+        winner = strat;
+        return page0;
+      }
+    } catch (e) {
+      // log and continue to next strategy
+      dlog(`[${reqId}] ${kind} failed strategy`, { strategy: strat.label, error: e?.message });
+      continue;
+    }
+  }
+  // none worked
+  throw new Error(`No ${kind} route matched; tried ${strategies.map(s => s.label).join(' | ')}`);
+}
+
+/** Pull all pages using a single working route (GET with query or POST with body). */
+async function pullAllPagesWithOneRoute(strat, bearer, userId, orgId, limit, reqId, label) {
   const out = [];
   let offset = 0;
-  const limit = 50;
 
   while (true) {
-    const url = new URL(baseUrl);
-    url.searchParams.set('limit', String(limit));
-    url.searchParams.set('offset', String(offset));
-
-    dlog(`[${reqId}] GET ${url.toString()} (${label})`, { offset, limit });
-    const resp = await fetchWithRetry(url.toString(), {
+    const hasBody = typeof strat.body === 'function';
+    let urlObj = new URL(strat.url);
+    let init = {
+      method: strat.method,
       headers: {
         'Authorization': `Bearer ${bearer}`,
         'x-fv-userid': String(userId),
         'x-fv-orgid': String(orgId),
         'Accept': 'application/json'
       }
-    }, reqId);
-    dlog(`[${reqId}] ${label} page response`, { status: resp.status, offset });
+    };
 
-    if (!resp.ok) {
-      await logErrorBody(resp, reqId, `${label}-page`);
-      throw new Error(`${url.pathname} error: ${resp.status}`);
+    if (strat.method === 'GET') {
+      urlObj.searchParams.set('limit', String(limit));
+      urlObj.searchParams.set('offset', String(offset));
+      if (strat.qp) {
+        for (const [k, v] of Object.entries(strat.qp)) urlObj.searchParams.set(k, String(v));
+      }
+    } else {
+      // POST variants
+      init.headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify({ limit, offset, ...(hasBody ? strat.body({ offset, limit }) : {}) });
     }
 
-    const data = await safeJson(resp, reqId, `${label}-page`);
-    const items = data?.items || data?.data || data?.results || [];
+    const urlStr = urlObj.toString();
+    dlog(`[${reqId}] ${strat.method} ${urlStr} (${label})`, { offset, limit, strategy: strat.label });
+    const resp = await fetchWithRetry(urlStr, init, reqId);
+    dlog(`[${reqId}] ${label} page response`, { status: resp.status, offset, strategy: strat.label });
+
+    if (!resp.ok) {
+      await logErrorBody(resp, reqId, `${label}-page(${strat.label})`);
+      // treat 404/405/etc. as "this route doesn't exist" → throw to advance strategy
+      throw new Error(`${urlObj.pathname} ${strat.method} error: ${resp.status}`);
+    }
+
+    const data = await safeJson(resp, reqId, `${label}-page(${strat.label})`);
+    const items = extractItems(data);
     out.push(...items);
 
-    const hasMore = data?.hasMore === true || (items.length === limit);
-    dlog(`[${reqId}] ${label} page parsed`, { itemsReceived: items.length, totalAccumulated: out.length, hasMore });
+    const hasMore = inferHasMore(data, items, limit, offset);
+    dlog(`[${reqId}] ${label} page parsed`, {
+      itemsReceived: items.length,
+      totalAccumulated: out.length,
+      hasMore,
+      strategy: strat.label
+    });
 
     if (!hasMore) break;
     offset += limit;
@@ -231,7 +307,27 @@ async function pullAllPages(baseUrl, bearer, userId, orgId, reqId, label) {
   return out;
 }
 
-/** Minimal retry + logging for transient 5xx responses. */
+/** Attempt to find the array of items under various common shapes. */
+function extractItems(data) {
+  if (!data) return [];
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data.items)) return data.items;
+  if (Array.isArray(data.results)) return data.results;
+  if (Array.isArray(data.data)) return data.data;
+  if (Array.isArray(data.activityItems)) return data.activityItems;
+  if (data.page && Array.isArray(data.page.items)) return data.page.items;
+  return [];
+}
+
+/** Determine whether to continue paging. */
+function inferHasMore(data, items, limit, offset) {
+  if (data?.hasMore === true) return true;
+  if (data?.nextOffset != null) return true;
+  // fallback: if we got a full page, assume there might be more
+  return items.length === limit;
+}
+
+/** Retry + logging for transient errors. */
 async function fetchWithRetry(input, init = {}, reqId, retries = 2, delayMs = 250) {
   let attempt = 0;
   while (true) {
@@ -262,7 +358,6 @@ async function safeJson(resp, reqId, tag) {
     const text = await resp.text();
     try {
       const json = JSON.parse(text);
-      // Log a redacted preview (no secrets)
       dlog(`[${reqId}] ${tag} JSON preview`, previewJson(json));
       return json;
     } catch {
@@ -303,9 +398,7 @@ function summarize(v) {
   if (Array.isArray(v)) return `[array len=${v.length}]`;
   if (typeof v === 'object') return `{object keys=${Object.keys(v).length}}`;
   const s = String(v);
-  return s.length > 120 ? s.slice(0, 120) + '…' : s;
+  return s.length > 160 ? s.slice(0, 160) + '…' : s;
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
