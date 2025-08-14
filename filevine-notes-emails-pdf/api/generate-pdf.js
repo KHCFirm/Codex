@@ -12,7 +12,7 @@ import PDFDocument from 'pdfkit';
 
 const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
 const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2';     // non-regional
-const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2';  // US regional
+const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2';     // Changed from v2-us to v2
 const DEBUG = (process.env.DEBUG ?? 'true').toLowerCase() !== 'false';
 
 const REQ = () => Math.random().toString(36).slice(2, 10);
@@ -50,22 +50,32 @@ export default async function handler(req, res) {
 
     // 4) Normalize + merge chronologically
     const merged = [
-      ...notes.map(n => ({
-        type: 'Note',
-        id: n?.id ?? n?.noteId,
-        created: n?.createdDate || n?.created || n?.date,
-        author: n?.createdBy?.name || n?.author?.name || n?.user?.name,
-        title: n?.title || '',
-        body: n?.body || n?.text || ''
-      })),
-      ...emails.map(e => ({
-        type: 'Email',
-        id: e?.id ?? e?.emailId,
-        created: e?.createdDate || e?.dateReceived || e?.date,
-        author: e?.from?.name || e?.sender?.name || e?.createdBy?.name,
-        title: e?.subject || '',
-        body: e?.body || ''
-      }))
+      ...notes.map((n, index) => {
+        // Debug the first note
+        if (index === 0) debugDateFields([n], 'Note', reqId);
+        
+        return {
+          type: 'Note',
+          id: n?.id ?? n?.noteId,
+          created: extractDate(n, 'note'),
+          author: n?.createdBy?.name || n?.author?.name || n?.user?.name || n?.createdBy,
+          title: n?.title || n?.subject || '',
+          body: n?.body || n?.text || n?.content || ''
+        };
+      }),
+      ...emails.map((e, index) => {
+        // Debug the first email
+        if (index === 0) debugDateFields([e], 'Email', reqId);
+        
+        return {
+          type: 'Email',
+          id: e?.id ?? e?.emailId,
+          created: extractDate(e, 'email'),
+          author: e?.from?.name || e?.sender?.name || e?.createdBy?.name || e?.from || e?.sender,
+          title: e?.subject || e?.title || '',
+          body: e?.body || e?.content || e?.text || ''
+        };
+      })
     ].sort((a, b) => new Date(a.created || 0) - new Date(b.created || 0));
 
     dlog(`[${reqId}] Merge complete`, { mergedCount: merged.length });
@@ -117,9 +127,78 @@ export default async function handler(req, res) {
 
 /* ---------- helpers ---------- */
 
+function debugDateFields(items, type, reqId) {
+  if (items.length > 0) {
+    const sample = items[0];
+    const dateFields = Object.keys(sample).filter(key => 
+      key.toLowerCase().includes('date') || 
+      key.toLowerCase().includes('time') ||
+      key.toLowerCase().includes('created') ||
+      key.toLowerCase().includes('received') ||
+      key.toLowerCase().includes('sent')
+    );
+    
+    dlog(`[${reqId}] ${type} sample date fields:`, {
+      availableFields: dateFields,
+      sampleValues: dateFields.reduce((acc, field) => {
+        acc[field] = sample[field];
+        return acc;
+      }, {}),
+      allFields: Object.keys(sample).slice(0, 10) // Limit to first 10 fields to avoid spam
+    });
+  }
+}
+
+function extractDate(item, type) {
+  // Common date field names to try
+  const dateFields = type === 'note' 
+    ? [
+        'createdDate', 'created', 'date', 'dateCreated', 'createDate',
+        'timestamp', 'createdAt', 'dateTime', 'noteDate', 'updatedDate'
+      ]
+    : [
+        'dateReceived', 'dateSent', 'createdDate', 'created', 'date', 
+        'dateCreated', 'createDate', 'timestamp', 'createdAt', 'dateTime',
+        'receivedDate', 'sentDate', 'emailDate', 'updatedDate'
+      ];
+  
+  for (const field of dateFields) {
+    const value = item?.[field];
+    if (value) {
+      // Try to parse the date
+      const parsed = new Date(value);
+      if (!isNaN(parsed.getTime())) {
+        return value; // Return original value if it parses correctly
+      }
+    }
+  }
+  
+  // If no valid date found, return current timestamp as fallback
+  console.warn(`No valid date found for ${type}:`, Object.keys(item || {}));
+  return new Date().toISOString();
+}
+
 function fmt(d) {
-  try { return new Date(d).toLocaleString('en-US', { hour12: false }); }
-  catch { return d || ''; }
+  if (!d) return 'No Date';
+  
+  try {
+    const date = new Date(d);
+    if (isNaN(date.getTime())) {
+      console.warn('Invalid date value:', d);
+      return 'Invalid Date';
+    }
+    return date.toLocaleString('en-US', { 
+      year: 'numeric',
+      month: '2-digit', 
+      day: '2-digit',
+      hour: '2-digit', 
+      minute: '2-digit',
+      hour12: false 
+    });
+  } catch (err) {
+    console.warn('Date formatting error:', err.message, 'for value:', d);
+    return 'Date Error';
+  }
 }
 
 function stripHtml(html) {
