@@ -7,12 +7,13 @@ import PDFDocument from 'pdfkit';
  *  - FILEVINE_PAT_TOKEN
  *  - DEBUG (optional: "true" | "false"; default "true")
  *
- * US-only; global hosts (api.filevineapp.com).
+ * New API gateway (global): api.filevineapp.com/fv-app/v2
+ * Notes/comments are NOT project-scoped in v2; use /notes/{noteId}/comments.
  */
 
 const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
-const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2';     // non-regional
-const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2';     // Changed from v2-us to v2
+const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2'; // non-regional
+const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2'; // keep global v2
 const DEBUG = (process.env.DEBUG ?? 'true').toLowerCase() !== 'false';
 
 const REQ = () => Math.random().toString(36).slice(2, 10);
@@ -41,7 +42,7 @@ export default async function handler(req, res) {
     const { userId, orgId } = await getUserAndOrgIds(token, reqId);
     dlog(`[${reqId}] Using gateway headers`, { 'x-fv-userid': userId, 'x-fv-orgid': orgId });
 
-    // 3) Pull notes & emails (multi-strategy to be resilient)
+    // 3) Pull notes & emails
     const [notesRaw, emails] = await Promise.all([
       pullWithStrategies('notes', projectId, token, userId, orgId, reqId),
       pullWithStrategies('emails', projectId, token, userId, orgId, reqId)
@@ -61,9 +62,7 @@ export default async function handler(req, res) {
     // 4) Normalize + merge chronologically
     const merged = [
       ...notes.map((n, index) => {
-        // Debug the first note
         if (index === 0) debugDateFields([n], 'Note', reqId);
-
         return {
           type: 'Note',
           id: normalizeId(n?.id ?? n?.noteId),
@@ -75,9 +74,7 @@ export default async function handler(req, res) {
         };
       }),
       ...emails.map((e, index) => {
-        // Debug the first email
         if (index === 0) debugDateFields([e], 'Email', reqId);
-
         return {
           type: 'Email',
           id: normalizeId(e?.id ?? e?.emailId),
@@ -198,49 +195,42 @@ function debugDateFields(items, type, reqId) {
         acc[field] = sample[field];
         return acc;
       }, {}),
-      allFields: Object.keys(sample).slice(0, 10) // Limit to first 10 fields to avoid spam
+      allFields: Object.keys(sample).slice(0, 10)
     });
   }
 }
 
 function extractDate(item, type) {
-  // Common date field names to try
   const dateFields =
     type === 'note'
       ? [
-          'createdDate', 'created', 'date', 'dateCreated', 'createDate',
-          'timestamp', 'createdAt', 'dateTime', 'noteDate', 'updatedDate'
+          'createdDate','created','date','dateCreated','createDate',
+          'timestamp','createdAt','dateTime','noteDate','updatedDate'
         ]
       : type === 'email'
       ? [
-          'dateReceived', 'dateSent', 'createdDate', 'created', 'date',
-          'dateCreated', 'createDate', 'timestamp', 'createdAt', 'dateTime',
-          'receivedDate', 'sentDate', 'emailDate', 'updatedDate'
+          'dateReceived','dateSent','createdDate','created','date',
+          'dateCreated','createDate','timestamp','createdAt','dateTime',
+          'receivedDate','sentDate','emailDate','updatedDate'
         ]
       : [
-          // comment or fallback
-          'createdDate', 'created', 'date', 'dateCreated', 'createDate',
-          'timestamp', 'createdAt', 'dateTime', 'commentDate', 'updatedDate'
+          'createdDate','created','date','dateCreated','createDate',
+          'timestamp','createdAt','dateTime','commentDate','updatedDate'
         ];
 
   for (const field of dateFields) {
     const value = item?.[field];
     if (value) {
       const parsed = new Date(value);
-      if (!isNaN(parsed.getTime())) {
-        return value; // Return original value if it parses correctly
-      }
+      if (!isNaN(parsed.getTime())) return value;
     }
   }
-
-  // If no valid date found, return current timestamp as fallback
   console.warn(`No valid date found for ${type}:`, Object.keys(item || {}));
   return new Date().toISOString();
 }
 
 function fmt(d) {
   if (!d) return 'No Date';
-
   try {
     const date = new Date(d);
     if (isNaN(date.getTime())) {
@@ -272,10 +262,19 @@ function stripHtml(html) {
     .trim();
 }
 
+function toAbsoluteUrl(pathOrUrl) {
+  // If Filevine returns a relative HAL link (e.g., "/notes/{id}/comments"), make it absolute.
+  try {
+    return new URL(pathOrUrl, GATEWAY_REGION_BASE).toString();
+  } catch {
+    return String(pathOrUrl || '');
+  }
+}
+
 async function getBearerToken(reqId) {
   const client_id = process.env.FILEVINE_CLIENT_ID;
   const client_secret = process.env.FILEVINE_CLIENT_SECRET;
-  const pat_token = process.env.FILEVINE_PAT_TOKEN; // Personal Access Token
+  const pat_token = process.env.FILEVINE_PAT_TOKEN;
   if (!client_id || !client_secret || !pat_token) throw new Error('Missing Filevine credentials in env vars');
 
   const body = new URLSearchParams();
@@ -316,7 +315,6 @@ async function getUserAndOrgIds(bearer, reqId) {
   }
   const data = await safeJson(resp, reqId, 'getUserOrgsWithToken');
 
-  // Robust extraction → **numbers/strings only**
   const userId = pickUserId(data);
   const orgId  = pickOrgId(data);
 
@@ -402,7 +400,7 @@ async function pullAllPagesWithOneRoute(strat, bearer, userId, orgId, limit, req
   while (true) {
     const hasBody = typeof strat.body === 'function';
     let urlObj = new URL(strat.url);
-    let init = {
+    const init = {
       method: strat.method,
       headers: {
         'Authorization': `Bearer ${bearer}`,
@@ -422,7 +420,11 @@ async function pullAllPagesWithOneRoute(strat, bearer, userId, orgId, limit, req
     }
 
     const urlStr = urlObj.toString();
-    dlog(`[${reqId}] ${strat.method} ${urlStr} (${label})`, { offset, limit, strategy: strat.label, headers: { 'x-fv-userid': String(userId), 'x-fv-orgid': String(orgId) } });
+    dlog(`[${reqId}] ${strat.method} ${urlStr} (${label})`, {
+      offset, limit, strategy: strat.label,
+      headers: { 'x-fv-userid': String(userId), 'x-fv-orgid': String(orgId) }
+    });
+
     const resp = await fetchWithRetry(urlStr, init, reqId);
     dlog(`[${reqId}] ${label} page response`, { status: resp.status, offset, strategy: strat.label });
 
@@ -457,11 +459,15 @@ function extractItems(data) {
   if (Array.isArray(data.data)) return data.data;
   if (Array.isArray(data.activityItems)) return data.activityItems;
   if (data.page && Array.isArray(data.page.items)) return data.page.items;
+  // Some endpoints may wrap in { comments: [] } — keep a defensive fallback:
+  if (Array.isArray(data.comments)) return data.comments;
   return [];
 }
 
 function inferHasMore(data, items, limit, _offset) {
-  if (data?.hasMore === true) return true;
+  if (data?.hasMore === true) return true; // strict boolean
+  // Some gateways serialize booleans as strings:
+  if (typeof data?.hasMore === 'string' && data.hasMore.toLowerCase() === 'true') return true;
   if (data?.nextOffset != null) return true;
   return items.length === limit;
 }
@@ -563,12 +569,14 @@ function extractEmbeddedComments(note) {
 }
 
 function commentsLinkFromNote(note) {
-  return (
+  // Support a few HAL shapes; prefer string hrefs.
+  const candidate =
     note?._links?.comments?.href ||
+    note?._links?.comments ||
     note?.links?.comments?.href ||
     note?.links?.comments ||
-    null
-  );
+    null;
+  return candidate ? String(candidate) : null;
 }
 
 async function attachCommentsToNotes({ notes, projectId, token, userId, orgId, reqId }) {
@@ -623,40 +631,26 @@ async function attachCommentsToNotes({ notes, projectId, token, userId, orgId, r
 }
 
 async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId, orgId, reqId }) {
-  const base = `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}`;
-  const nid  = encodeURIComponent(String(noteId));
   const limit = 50;
+  const nid  = encodeURIComponent(String(noteId));
 
-  // Try explicit per-item link first
+  // 1) Try explicit per-item HAL link first (often "/notes/{id}/comments")
   if (explicitUrl) {
+    const abs = toAbsoluteUrl(explicitUrl);
     try {
       const items = await pullAllPagesWithOneRoute(
-        { label: 'GET link:comments', method: 'GET', url: explicitUrl },
+        { label: 'GET link:comments', method: 'GET', url: abs },
         bearer, userId, orgId, limit, reqId, `comments[note:${noteId}]`
       );
       if (Array.isArray(items) && items.length) return normalizeComments(items);
     } catch (e) {
-      dlog(`[${reqId}] comments explicit link failed`, { url: explicitUrl, error: e?.message });
+      dlog(`[${reqId}] comments explicit link failed`, { url: explicitUrl, abs, error: e?.message });
     }
   }
 
+  // 2) Fallback: global notes resource (NOT project-scoped) → /notes/{noteId}/comments
   const strategies = [
-    { label: 'GET notes/{id}/comments',  method: 'GET',  url: `${base}/notes/${nid}/comments` },
-    { label: 'GET notes/{id}/replies',   method: 'GET',  url: `${base}/notes/${nid}/replies` },
-    { label: 'POST notes/{id}/comments', method: 'POST', url: `${base}/notes/${nid}/comments`,
-      body: ({offset, limit}) => ({ offset, limit }) },
-
-    // collection-level comments endpoints
-    { label: 'GET comments',             method: 'GET',  url: `${base}/comments`, qp: { parentType: 'note', parentId: String(noteId) } },
-    { label: 'GET comments/list',        method: 'GET',  url: `${base}/comments/list`, qp: { parentType: 'note', parentId: String(noteId), limit, offset: 0 } },
-    { label: 'POST comments',            method: 'POST', url: `${base}/comments`,
-      body: ({offset, limit}) => ({ parentType: 'note', parentId: String(noteId), offset, limit }) },
-    { label: 'POST comments/list',       method: 'POST', url: `${base}/comments/list`,
-      body: ({offset, limit}) => ({ parentType: 'note', parentId: String(noteId), offset, limit }) },
-
-    // activity fallback
-    { label: 'GET activity?types=comment', method: 'GET',
-      url: `${base}/activity`, qp: { types: 'comment', parentType: 'note', parentId: String(noteId) } },
+    { label: 'GET /notes/{id}/comments', method: 'GET', url: `${GATEWAY_REGION_BASE}/notes/${nid}/comments` }
   ];
 
   for (const strat of strategies) {
