@@ -7,7 +7,8 @@ import PDFDocument from 'pdfkit';
  *  - FILEVINE_PAT_TOKEN
  */
 const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
-const GATEWAY_BASE = 'https://api.filevineapp.com/fv-app/v2';
+// Use v2-us for US tenants; switch to v2-ca if your tenant is in Canada.
+const GATEWAY_BASE = 'https://api.filevineapp.com/fv-app/v2-us';
 
 export default async function handler(req, res) {
   try {
@@ -32,8 +33,22 @@ export default async function handler(req, res) {
 
     // 4) Normalize + merge chronologically
     const merged = [
-      ...notes.map(n => ({ type: 'Note', id: n?.id ?? n?.noteId, created: n?.createdDate || n?.created || n?.date, author: n?.createdBy?.name || n?.author?.name || n?.user?.name, title: n?.title || '', body: n?.body || n?.text || '' })),
-      ...emails.map(e => ({ type: 'Email', id: e?.id ?? e?.emailId, created: e?.createdDate || e?.dateReceived || e?.date, author: e?.from?.name || e?.sender?.name || e?.createdBy?.name, title: e?.subject || '', body: e?.body || '' }))
+      ...notes.map(n => ({
+        type: 'Note',
+        id: n?.id ?? n?.noteId,
+        created: n?.createdDate || n?.created || n?.date,
+        author: n?.createdBy?.name || n?.author?.name || n?.user?.name,
+        title: n?.title || '',
+        body: n?.body || n?.text || ''
+      })),
+      ...emails.map(e => ({
+        type: 'Email',
+        id: e?.id ?? e?.emailId,
+        created: e?.createdDate || e?.dateReceived || e?.date,
+        author: e?.from?.name || e?.sender?.name || e?.createdBy?.name,
+        title: e?.subject || '',
+        body: e?.body || ''
+      }))
     ].sort((a, b) => new Date(a.created || 0) - new Date(b.created || 0));
 
     // 5) Stream a PDF
@@ -54,14 +69,22 @@ export default async function handler(req, res) {
     } else {
       for (const item of merged) {
         doc.moveDown();
-        doc.fontSize(12).fillColor('#000').text(`${item.type} • ${fmt(item.created)}${item.author ? ` • ${item.author}` : ''}`, { continued: false });
+        doc.fontSize(12).fillColor('#000').text(
+          `${item.type} • ${fmt(item.created)}${item.author ? ` • ${item.author}` : ''}`,
+          { continued: false }
+        );
         if (item.title) {
           doc.font('Helvetica-Bold').text(item.title);
           doc.font('Helvetica');
         }
         if (item.body) doc.fontSize(11).fillColor('#111').text(stripHtml(item.body), { align: 'left' });
         doc.moveDown(0.25);
-        doc.strokeColor('#ddd').lineWidth(1).moveTo(doc.page.margins.left, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).stroke();
+        doc
+          .strokeColor('#ddd')
+          .lineWidth(1)
+          .moveTo(doc.page.margins.left, doc.y)
+          .lineTo(doc.page.width - doc.page.margins.right, doc.y)
+          .stroke();
       }
     }
 
@@ -75,7 +98,11 @@ export default async function handler(req, res) {
 }
 
 function fmt(d) {
-  try { return new Date(d).toLocaleString('en-US', { hour12: false }); } catch { return d || ''; }
+  try {
+    return new Date(d).toLocaleString('en-US', { hour12: false });
+  } catch {
+    return d || '';
+  }
 }
 
 function stripHtml(html) {
@@ -98,7 +125,7 @@ async function getBearerToken() {
 
   const resp = await fetch(IDENTITY_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
     body
   });
   if (!resp.ok) throw new Error(`Identity token error: ${resp.status}`);
@@ -108,12 +135,17 @@ async function getBearerToken() {
 }
 
 async function getUserAndOrgIds(bearer) {
-  const resp = await fetch(`${GATEWAY_BASE}/utils/GetUserOrgsWithToken`, {
+  const resp = await fetchWithRetry(`${GATEWAY_BASE}/utils/GetUserOrgsWithToken`, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${bearer}` }
+    headers: {
+      'Authorization': `Bearer ${bearer}`,
+      'Accept': 'application/json'
+    }
   });
   if (!resp.ok) throw new Error(`GetUserOrgsWithToken error: ${resp.status}`);
   const data = await resp.json();
+
+  // Prefer current user and primary org if present
   let userId = data?.userId || data?.user?.id || data?.user?.userId;
   let orgId = data?.orgId || data?.org?.id || data?.orgs?.[0]?.orgId || data?.orgs?.[0]?.id;
   if (!userId || !orgId) throw new Error('Could not resolve userId/orgId from gateway response');
@@ -124,24 +156,47 @@ async function pullAllPages(baseUrl, bearer, userId, orgId) {
   const out = [];
   let offset = 0;
   const limit = 50;
+
   while (true) {
     const url = new URL(baseUrl);
     url.searchParams.set('limit', String(limit));
     url.searchParams.set('offset', String(offset));
-    const resp = await fetch(url.toString(), {
+
+    const resp = await fetchWithRetry(url.toString(), {
       headers: {
         'Authorization': `Bearer ${bearer}`,
         'x-fv-userid': String(userId),
-        'x-fv-orgid': String(orgId)
+        'x-fv-orgid': String(orgId),
+        'Accept': 'application/json'
       }
     });
     if (!resp.ok) throw new Error(`${url.pathname} error: ${resp.status}`);
+
     const data = await resp.json();
     const items = data?.items || data?.data || data?.results || [];
     out.push(...items);
+
     const hasMore = data?.hasMore === true || (items.length === limit);
     if (!hasMore) break;
     offset += limit;
   }
   return out;
+}
+
+/**
+ * Minimal retry for transient 5xx responses.
+ */
+async function fetchWithRetry(input, init = {}, retries = 2, delayMs = 250) {
+  let attempt = 0;
+  while (true) {
+    const resp = await fetch(input, init);
+    if (resp.status < 500 || retries === 0) return resp;
+    attempt++;
+    await sleep(delayMs * attempt); // backoff
+    retries--;
+  }
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
