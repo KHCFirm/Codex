@@ -1,0 +1,14 @@
+{
+  "name": "filevine-notes-emails-pdf",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "echo 'No build step'",
+    "start": "vercel dev"
+  },
+  "dependencies": {
+    "pdfkit": "^0.13.0"
+  }
+}

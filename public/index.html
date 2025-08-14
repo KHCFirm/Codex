@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Filevine Notes+Emails → PDF</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 2rem; max-width: 720px; margin: auto; }
+    form { display: flex; gap: .5rem; align-items: center; }
+    input, button { font-size: 1rem; padding: .6rem .8rem; }
+    button { cursor: pointer; }
+    .hint { opacity: .75; margin-top: .75rem; }
+    .log { margin-top: 1rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .95rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Filevine Notes+Emails → PDF</h1>
+  <p>Enter a Filevine <strong>Project ID</strong>, then download a combined Notes & Emails PDF.</p>
+  <form id="f">
+    <input id="projectId" name="projectId" type="number" required placeholder="e.g., 123456" />
+    <button type="submit">Generate PDF</button>
+  </form>
+  <p class="hint">No secrets are stored in the browser. All Filevine calls are made server-side.</p>
+  <div class="log" id="log"></div>
+
+  <script>
+    const log = (msg) => document.getElementById('log').textContent = msg;
+
+    document.getElementById('f').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const projectId = document.getElementById('projectId').value.trim();
+      if (!projectId) return;
+      log('Generating PDF…');
+      try {
+        const res = await fetch(`/api/generate-pdf?projectId=${encodeURIComponent(projectId)}`);
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`HTTP ${res.status}: ${text}`);
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        const now = new Date().toISOString().slice(0,10);
+        a.download = `project-${projectId}-notes-emails-${now}.pdf`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        log('Done. PDF downloaded.');
+      } catch (err) {
+        console.error(err);
+        log(err.message);
+      }
+    });
+  </script>
+</body>
+</html>
