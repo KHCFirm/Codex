@@ -62,18 +62,19 @@ export default async function handler(req, res) {
       reqId
     });
 
-    // 3c) Enrich authors for notes missing a clear author (follows HAL _links.createdBy, then /users/{id})
-    await enrichNoteAuthors(notesWithComments, token, userId, orgId, reqId);
+    // 3c) Build user cache by fetching all unique user IDs we found
+    const userCache = await buildUserCache(notesWithComments, token, userId, orgId, reqId);
 
-    // 3d) Enrich authors for comments that lack a name (resolve via /users/{id})
-    await enrichCommentAuthors(notesWithComments, token, userId, orgId, reqId);
+    // 3d) Apply authors using the cache
+    applyAuthorsFromCache(notesWithComments, userCache, reqId);
 
-    // 3e) DEBUG: show the extracted/enriched author outcome for the first note
+    // 3e) DEBUG: show the final author outcome for the first note
     if (Array.isArray(notesWithComments) && notesWithComments.length) {
       const first = notesWithComments[0];
-      dlog(`[${reqId}] First note author extracted`, {
+      dlog(`[${reqId}] First note final author`, {
         extracted: extractNoteAuthor(first),
-        enriched: first?.__author ?? null
+        cached: first?.__author ?? null,
+        finalAuthor: first?.__author || extractNoteAuthor(first) || 'Unknown'
       });
     }
 
@@ -85,10 +86,13 @@ export default async function handler(req, res) {
           type: 'Note',
           id: normalizeId(n?.id ?? n?.noteId),
           created: extractDate(n, 'note'),
-          author: n?.__author || extractNoteAuthor(n), // ← prefer enriched, fallback to extractor
+          author: n?.__author || extractNoteAuthor(n) || 'Unknown', // Ensure we have a fallback
           title: n?.title || n?.subject || '',
           body: n?.body || n?.text || n?.content || '',
-          comments: Array.isArray(n?.comments) ? n.comments : []
+          comments: Array.isArray(n?.comments) ? n.comments.map(c => ({
+            ...c,
+            author: c?.author || 'Unknown' // Ensure comments have author fallback too
+          })) : []
         };
       }),
       ...emails.map((e, index) => {
@@ -97,7 +101,7 @@ export default async function handler(req, res) {
           type: 'Email',
           id: normalizeId(e?.id ?? e?.emailId),
           created: extractDate(e, 'email'),
-          author: extractAuthor(e),
+          author: extractAuthor(e) || 'Unknown', // Ensure emails have author fallback
           title: e?.subject || e?.title || '',
           body: e?.body || e?.content || e?.text || ''
         };
@@ -271,17 +275,27 @@ function pickName(x) {
 
 function collectAuthorIdCandidates(note) {
   const ids = [];
-  const push = (v) => { if (v != null) ids.push(String(v)); };
+  const push = (v) => { 
+    if (v != null) {
+      if (typeof v === 'object') {
+        // Handle nested ID objects
+        ids.push(String(v.native ?? v.id ?? v.userId ?? v));
+      } else {
+        ids.push(String(v)); 
+      }
+    }
+  };
   push(note?.createdById);
   push(note?.createdByUserId);
   push(note?.userId);
   push(note?.authorId);
+  push(note?.ownerId);
   if (note?.createdBy && typeof note.createdBy === 'object') {
     push(note.createdBy.id);
     push(note.createdBy.userId);
     push(note.createdBy.native);
   }
-  return ids.filter(Boolean);
+  return [...new Set(ids.filter(Boolean))]; // Remove duplicates
 }
 
 function debugNoteAuthorFields(notes, reqId) {
@@ -302,9 +316,7 @@ function debugNoteAuthorFields(notes, reqId) {
     userName: n?.userName,
     displayName: n?.displayName,
     fullName: n?.fullName,
-    createdById:
-      n?.createdById ?? n?.createdByUserId ?? n?.userId ?? n?.authorId ??
-      (typeof n?.createdBy === 'object' && (n.createdBy.id ?? n.createdBy.native)) ?? null,
+    createdById: summarize(n?.createdById),
     '_links.createdBy': summarize(n?._links?.createdBy),
     '_embedded.createdBy': summarize(n?._embedded?.createdBy),
     '_embedded.users.len': Array.isArray(n?._embedded?.users) ? n._embedded.users.length : 0
@@ -838,166 +850,48 @@ function normalizeComments(items) {
   });
 }
 
-/* ---------- author enrichment ---------- */
-
-function createdByLinkFromNote(note) {
-  return (
-    (note?._links?.createdBy?.href || note?._links?.createdBy) ||
-    (note?.links?.createdBy?.href   || note?.links?.createdBy) ||
-    null
-  ) ? String((note?._links?.createdBy?.href || note?._links?.createdBy || note?.links?.createdBy?.href || note?.links?.createdBy)) : null;
-}
+/* ---------- New simplified author enrichment approach ---------- */
 
 /**
- * For notes whose author name isn't obvious, try to resolve it by:
- *  1) Following the HAL createdBy link (GET that URL, cache it, pick a name)
- *  2) If no HAL link, request /users/{creatorId} based on createdById-like fields
- *  3) Matching against _embedded.users (if present) by creator id
+ * Build a cache of user information by collecting all unique user IDs
+ * from notes and comments, then fetching them in batches.
  */
-async function enrichNoteAuthors(notes, bearer, userId, orgId, reqId) {
-  if (!Array.isArray(notes) || !notes.length) return;
+async function buildUserCache(notes, bearer, userId, orgId, reqId) {
+  if (!Array.isArray(notes) || !notes.length) return new Map();
 
-  // Which notes still lack an author name?
-  const unresolved = notes.filter(n => {
-    const already = n?.__author || extractNoteAuthor(n);
-    return !already;
-  });
-  if (!unresolved.length) {
-    dlog(`[${reqId}] author enrichments`, { totalNotes: notes.length, unresolvedBefore: 0, unresolvedAfter: 0 });
-    return;
-  }
-
-  // 1) Follow HAL createdBy links (dedup + cache)
-  const hrefToNotes = new Map();
-  for (const n of unresolved) {
-    const href = createdByLinkFromNote(n);
-    if (href) {
-      const abs = toAbsoluteUrl(href);
-      if (!hrefToNotes.has(abs)) hrefToNotes.set(abs, []);
-      hrefToNotes.get(abs).push(n);
-    } else {
-      // 2) Fallback: construct a user URL from the note's creator ID
-      let creatorId = null;
-      if (n?.createdById) {
-        creatorId = typeof n.createdById === 'object'
-          ? (n.createdById.native || n.createdById.id || n.createdById.userId)
-          : n.createdById;
-      }
-      if (!creatorId) creatorId = n?.createdByUserId || n?.userId || n?.authorId || null;
-      if (creatorId) {
-        const abs = toAbsoluteUrl(`/users/${creatorId}`);
-        if (!hrefToNotes.has(abs)) hrefToNotes.set(abs, []);
-        hrefToNotes.get(abs).push(n);
-      }
-    }
-  }
-
-  const entries = Array.from(hrefToNotes.entries());
-  const MAX_CONCURRENCY = Math.min(6, Math.max(1, entries.length));
-  let idx = 0;
-
-  async function worker() {
-    while (idx < entries.length) {
-      const [abs, bucket] = entries[idx++];
-      try {
-        const init = {
-          method: 'GET',
-          headers: {
-            'Authorization': `Bearer ${bearer}`,
-            'x-fv-userid': String(userId),
-            'x-fv-orgid': String(orgId),
-            'Accept': 'application/json'
-          }
-        };
-        dlog(`[${reqId}] GET ${abs} (author-resolve)`);
-        const resp = await fetchWithRetry(abs, init, reqId);
-        dlog(`[${reqId}] author-resolve response`, { status: resp.status });
-        if (!resp.ok) {
-          await logErrorBody(resp, reqId, 'author-resolve');
-          continue;
-        }
-        const data = await safeJson(resp, reqId, 'author-resolve');
-        const name =
-          pickName(data) ||
-          pickName(data?.user) ||
-          pickName(data?.person) ||
-          pickName(data?.profile) ||
-          data?.displayName ||
-          data?.fullName ||
-          data?.name ||
-          '';
-        if (name) {
-          for (const n of bucket) n.__author = name;
-        } else {
-          dlog(`[${reqId}] author-resolve no usable name`, { keys: Object.keys(data || {}) });
-        }
-      } catch (e) {
-        dlog(`[${reqId}] author-resolve failed`, { url: abs, error: e?.message });
-      }
-    }
-  }
-  await Promise.all(Array.from({ length: MAX_CONCURRENCY }, () => worker()));
-
-  // 3) Embedded users matching by id (for any still unresolved)
-  for (const n of unresolved) {
-    if (n.__author) continue;
-    const idCandidates = collectAuthorIdCandidates(n);
-    const users = n?._embedded?.users || n?.embedded?.users;
-    if (Array.isArray(users) && idCandidates.length) {
-      for (const u of users) {
-        const uid = String(u?.id ?? u?.userId ?? u?.native ?? '');
-        if (uid && idCandidates.includes(uid)) {
-          const nm = pickName(u);
-          if (nm) { n.__author = nm; break; }
-        }
-      }
-    }
-  }
-
-  const still = notes.filter(n => !(n.__author || extractNoteAuthor(n))).length;
-  dlog(`[${reqId}] author enrichments`, {
-    totalNotes: notes.length,
-    unresolvedBefore: unresolved.length,
-    unresolvedAfter: still,
-    halLinksFollowed: entries.length
-  });
-}
-
-/**
- * For comments that don't include a ready-made author name,
- * resolve via /users/{id} using the captured __authorId on each comment.
- */
-async function enrichCommentAuthors(notes, bearer, userId, orgId, reqId) {
-  if (!Array.isArray(notes) || !notes.length) return;
-
-  const userUrlMap = new Map(); // userUrl -> list of comment objects needing that user
+  // Collect all unique user IDs from notes and their comments
+  const userIds = new Set();
+  
   for (const note of notes) {
-    if (!Array.isArray(note?.comments)) continue;
-    for (const c of note.comments) {
-      if (!c?.author) {
-        const uid = c?.__authorId;
-        if (!uid) continue;
-        const absUrl = toAbsoluteUrl(`/users/${uid}`);
-        if (!userUrlMap.has(absUrl)) userUrlMap.set(absUrl, []);
-        userUrlMap.get(absUrl).push(c);
+    // Collect user IDs from the note itself
+    const noteUserIds = collectAuthorIdCandidates(note);
+    noteUserIds.forEach(id => userIds.add(id));
+    
+    // Collect user IDs from comments
+    if (Array.isArray(note.comments)) {
+      for (const comment of note.comments) {
+        if (comment.__authorId) {
+          userIds.add(String(comment.__authorId));
+        }
       }
     }
   }
 
-  if (userUrlMap.size === 0) {
-    dlog(`[${reqId}] Comment author enrichment: none needed (all names present)`);
-    return;
-  }
+  dlog(`[${reqId}] Building user cache for ${userIds.size} unique user IDs`);
+  
+  if (userIds.size === 0) return new Map();
 
-  const entries = Array.from(userUrlMap.entries());
-  const MAX_CONCURRENCY = Math.min(6, entries.length);
+  // Fetch user details in parallel (limited concurrency)
+  const userCache = new Map();
+  const userIdArray = Array.from(userIds);
+  const MAX_CONCURRENCY = 6;
   let idx = 0;
 
   async function worker() {
-    while (idx < entries.length) {
-      const [userUrl, commentList] = entries[idx++];
+    while (idx < userIdArray.length) {
+      const currentUserId = userIdArray[idx++];
       try {
-        dlog(`[${reqId}] GET ${userUrl} (comment-author-resolve)`);
+        const userUrl = toAbsoluteUrl(`/users/${encodeURIComponent(currentUserId)}`);
         const resp = await fetchWithRetry(userUrl, {
           method: 'GET',
           headers: {
@@ -1007,30 +901,73 @@ async function enrichCommentAuthors(notes, bearer, userId, orgId, reqId) {
             'Accept': 'application/json'
           }
         }, reqId);
-        dlog(`[${reqId}] comment-author-resolve response`, { status: resp.status });
-        if (!resp.ok) {
-          await logErrorBody(resp, reqId, 'comment-author-resolve');
-          continue;
-        }
-        const data = await safeJson(resp, reqId, 'comment-author-resolve');
-        const name = pickName(data)
-          || pickName(data?.user)
-          || pickName(data?.person)
-          || pickName(data?.profile)
-          || data?.displayName
-          || data?.fullName
-          || data?.name
-          || '';
-        if (name) {
-          commentList.forEach(c => { c.author = name; });
+        
+        if (resp.ok) {
+          const userData = await safeJson(resp, reqId, `user-${currentUserId}`);
+          const userName = pickName(userData) || 
+                          pickName(userData?.user) || 
+                          pickName(userData?.person) || 
+                          userData?.displayName || 
+                          userData?.fullName || 
+                          userData?.name || 
+                          '';
+          
+          if (userName) {
+            userCache.set(currentUserId, userName);
+            dlog(`[${reqId}] Cached user ${currentUserId}: ${userName}`);
+          } else {
+            dlog(`[${reqId}] No name found for user ${currentUserId}`, { keys: Object.keys(userData || {}) });
+          }
         } else {
-          dlog(`[${reqId}] comment-author-resolve: no name found`, { keys: Object.keys(data || {}) });
+          dlog(`[${reqId}] Failed to fetch user ${currentUserId}: ${resp.status}`);
         }
-      } catch (e) {
-        dlog(`[${reqId}] comment-author-resolve failed`, { url: userUrl, error: e?.message });
+      } catch (err) {
+        dlog(`[${reqId}] Error fetching user ${currentUserId}:`, err?.message);
       }
     }
   }
+
   await Promise.all(Array.from({ length: MAX_CONCURRENCY }, () => worker()));
-  dlog(`[${reqId}] Comment author enrichment complete`, { totalUsers: userUrlMap.size });
+  
+  dlog(`[${reqId}] User cache built with ${userCache.size} entries`);
+  return userCache;
+}
+
+/**
+ * Apply cached user names to notes and comments
+ */
+function applyAuthorsFromCache(notes, userCache, reqId) {
+  if (!Array.isArray(notes) || !notes.length || userCache.size === 0) return;
+
+  let notesUpdated = 0;
+  let commentsUpdated = 0;
+
+  for (const note of notes) {
+    // Apply author to note if not already present
+    if (!note.__author && !extractNoteAuthor(note)) {
+      const noteUserIds = collectAuthorIdCandidates(note);
+      for (const uid of noteUserIds) {
+        if (userCache.has(uid)) {
+          note.__author = userCache.get(uid);
+          notesUpdated++;
+          break;
+        }
+      }
+    }
+
+    // Apply authors to comments
+    if (Array.isArray(note.comments)) {
+      for (const comment of note.comments) {
+        if (!comment.author && comment.__authorId) {
+          const cachedName = userCache.get(String(comment.__authorId));
+          if (cachedName) {
+            comment.author = cachedName;
+            commentsUpdated++;
+          }
+        }
+      }
+    }
+  }
+
+  dlog(`[${reqId}] Applied cached authors: ${notesUpdated} notes, ${commentsUpdated} comments`);
 }
