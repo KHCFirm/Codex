@@ -1,3 +1,4 @@
+
 import PDFDocument from 'pdfkit';
 
 /**
@@ -5,15 +6,20 @@ import PDFDocument from 'pdfkit';
  *  - FILEVINE_CLIENT_ID
  *  - FILEVINE_CLIENT_SECRET
  *  - FILEVINE_PAT_TOKEN
+ *  - FILEVINE_BASE_URL (optional; e.g., https://api.filevineapp.ca/fv-app/v2)
  *  - DEBUG (optional: "true" | "false"; default "true")
  *
- * New API gateway (global): api.filevineapp.com/fv-app/v2
- * Notes/comments are NOT project-scoped in v2; use /notes/{noteId}/comments.
+ * This function generates a PDF of Notes & Emails for a Filevine project.
+ * It now reliably resolves the **author** for each Note and **each Comment**
+ * by following HAL links OR falling back to GET /users/{id}.
+ *
+ * Fix: Robustly parse GetUserOrgsWithToken response to extract userId & orgId.
  */
 
 const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
-const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2'; // non-regional
-const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2'; // keep global v2
+const DEFAULT_BASE = 'https://api.filevineapp.com/fv-app/v2';
+const GATEWAY_REGION_BASE = (process.env.FILEVINE_BASE_URL || DEFAULT_BASE).replace(/\/+$/, '');
+const GATEWAY_UTILS_BASE  = GATEWAY_REGION_BASE; // same base for utils
 
 const DEBUG = String(process.env.DEBUG ?? 'true').toLowerCase() !== 'false';
 
@@ -39,7 +45,7 @@ export default async function handler(req, res) {
     // 1) OAuth2 (PAT → bearer)
     const token = await getBearerToken(reqId);
 
-    // 2) Resolve user/org
+    // 2) Resolve user/org using robust parsing
     const { userId, orgId } = await getUserAndOrgIds(token, reqId);
     dlog(`[${reqId}] Using gateway headers`, { 'x-fv-userid': userId, 'x-fv-orgid': orgId });
 
@@ -50,7 +56,7 @@ export default async function handler(req, res) {
     ]);
     dlog(`[${reqId}] Fetch complete`, { notesCount: notesRaw.length, emailsCount: emails.length });
 
-    // 3a) DEBUG: show author candidates for the first note we got back
+    // 3a) DEBUG: author fields on first note
     debugNoteAuthorFields(notesRaw, reqId);
 
     // 3b) Attach comments to notes
@@ -63,19 +69,9 @@ export default async function handler(req, res) {
       reqId
     });
 
-    // 3c) Enrich authors for notes missing a clear author (follows HAL _links.createdBy)
+    // 3c) Enrich note authors (HAL createdBy link → name), then final ID fallback
     await enrichNoteAuthors(notesWithComments, token, userId, orgId, reqId);
-    // 3c.1) Final fallback: resolve note authors by user ID if still missing
     await resolveNoteAuthorsById(notesWithComments, token, userId, orgId, reqId);
-
-    // 3d) DEBUG: show the extracted/enriched author outcome for the first note
-    if (notesWithComments.length) {
-      const first = notesWithComments[0];
-      dlog(`[${reqId}] First note author extracted`, {
-        extracted: extractNoteAuthor(first),
-        enriched: first?.__author ?? null
-      });
-    }
 
     // 4) Normalize + merge chronologically
     const merged = [
@@ -85,7 +81,7 @@ export default async function handler(req, res) {
           type: 'Note',
           id: normalizeId(n?.id ?? n?.noteId),
           created: extractDate(n, 'note'),
-          author: n?.__author || extractNoteAuthor(n), // ← prefer enriched, fallback to extractor
+          author: n?.__author || extractNoteAuthor(n),
           title: n?.title || n?.subject || '',
           body: n?.body || n?.text || n?.content || '',
           comments: Array.isArray(n?.comments) ? n.comments : []
@@ -138,7 +134,7 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error(`[${reqId}] generate-pdf failure`, err);
     res.statusCode = 500;
-    res.end(`Failed to generate PDF: ${err?.message || err}`);
+    res.end(\`Failed to generate PDF: \${err?.message || err}\`);
   }
 }
 
@@ -167,14 +163,8 @@ function safeDateTime(v) {
 
 function extractDate(item, kind) {
   const candidates = kind === 'email'
-    ? [
-        item?.createdAt, item?.created, item?.date,
-        item?.sentAt, item?.sentDate, item?.receivedAt
-      ]
-    : [
-        item?.createdAt, item?.created, item?.date,
-        item?.lastActivity, item?.targetDate, item?.completedDate
-      ];
+    ? [ item?.createdAt, item?.created, item?.date, item?.sentAt, item?.sentDate, item?.receivedAt ]
+    : [ item?.createdAt, item?.created, item?.date, item?.lastActivity, item?.targetDate, item?.completedDate ];
   for (const c of candidates) {
     const d = c ? new Date(c) : null;
     if (d && !isNaN(+d)) return d.toISOString();
@@ -183,7 +173,6 @@ function extractDate(item, kind) {
 }
 
 function extractAuthor(item) {
-  // Try common shapes for notes, emails, comments
   const pools = [
     item?.author, item?.from, item?.sender, item?.user, item?.owner,
     item?.createdBy, item?.createdByUser, item?.assignee, item?.completer
@@ -192,7 +181,6 @@ function extractAuthor(item) {
     const nm = pickName(p);
     if (nm) return nm;
   }
-  // flat strings too
   const flat = [
     item?.authorName, item?.createdByName, item?.createdByDisplayName,
     item?.displayName, item?.userFullName, item?.userName, item?.fullName
@@ -203,9 +191,6 @@ function extractAuthor(item) {
   return '';
 }
 
-/**
- * Notes sometimes use different shapes than comments/emails; this tries common note-specific fields first
- */
 function extractNoteAuthor(note) {
   const candidates = [
     note?.author, note?.from, note?.sender, note?.user, note?.owner,
@@ -213,13 +198,10 @@ function extractNoteAuthor(note) {
     note?.createdByName, note?.createdByDisplayName, note?.authorName,
     note?.userFullName, note?.userName, note?.displayName, note?.fullName
   ];
-
   for (const c of candidates) {
     const name = pickName(c);
     if (name) return name;
   }
-
-  // 3) Check embedded users, if any, with ID matching
   const idCandidates = collectAuthorIdCandidates(note);
   const users = note?._embedded?.users || note?.embedded?.users;
   if (Array.isArray(users) && idCandidates.length) {
@@ -231,8 +213,6 @@ function extractNoteAuthor(note) {
       }
     }
   }
-
-  // 4) Fallback to the generic extractor (covers some additional shapes)
   return extractAuthor(note);
 }
 
@@ -241,29 +221,33 @@ function pickName(x) {
   if (typeof x === 'string') return x;
   if (typeof x === 'object') {
     const name =
-      x.name ||
-      x.fullName ||
-      x.displayName ||
-      x.userFullName ||
-      (x.firstName || x.lastName ? `${x.firstName ?? ''} ${x.lastName ?? ''}`.trim() : '');
+      x.name || x.fullName || x.displayName || x.userFullName ||
+      (x.firstName || x.lastName ? \`\${x.firstName ?? ''} \${x.lastName ?? ''}\`.trim() : '');
     if (name) return String(name);
-    // Sometimes the HAL link object carries a title key
     if (x.title && typeof x.title === 'string') return x.title;
   }
   return '';
 }
 
-function collectAuthorIdCandidates(note) {
+function collectAuthorIdCandidates(noteOrComment) {
   const ids = [];
   const push = (v) => { if (v != null) ids.push(String(v)); };
-  push(note?.createdById);
-  push(note?.createdByUserId);
-  push(note?.userId);
-  push(note?.authorId);
-  if (note?.createdBy && typeof note.createdBy === 'object') {
-    push(note.createdBy.id);
-    push(note.createdBy.userId);
-    push(note.createdBy.native);
+  push(noteOrComment?.createdById);
+  push(noteOrComment?.createdByUserId);
+  push(noteOrComment?.userId);
+  push(noteOrComment?.authorId);
+  if (noteOrComment?.createdBy && typeof noteOrComment.createdBy === 'object') {
+    push(noteOrComment.createdBy.id);
+    push(noteOrComment.createdBy.userId);
+    push(noteOrComment.createdBy.native);
+    push(noteOrComment.createdBy.Native);
+  }
+  // If comment has 'user' object with id
+  if (noteOrComment?.user && typeof noteOrComment.user === 'object') {
+    push(noteOrComment.user.id);
+    push(noteOrComment.user.userId);
+    push(noteOrComment.user.native);
+    push(noteOrComment.user.Native);
   }
   return ids.filter(Boolean);
 }
@@ -292,7 +276,7 @@ function debugNoteAuthorFields(notes, reqId) {
     fullName: n?.fullName,
     createdById:
       n?.createdById ?? n?.createdByUserId ?? n?.userId ?? n?.authorId ??
-      (typeof n?.createdBy === 'object' && (n.createdBy?.id ?? n.createdBy?.userId ?? n.createdBy?.native)) ?? null
+      (typeof n?.createdBy === 'object' && (n.createdBy?.id ?? n.createdBy?.userId ?? n.createdBy?.native ?? n.createdBy?.Native)) ?? null
   });
 }
 
@@ -315,7 +299,6 @@ function debugDateFields(items, label, reqId) {
 /* ---------- URLs / HTTP ---------- */
 
 function toAbsoluteUrl(pathOrUrl) {
-  // If Filevine returns a relative HAL link (e.g., "/users/{id}"), make it absolute.
   try {
     return new URL(pathOrUrl, GATEWAY_REGION_BASE).toString();
   } catch {
@@ -350,6 +333,7 @@ async function getBearerToken(reqId) {
   return access_token;
 }
 
+/** Robust resolver for user/org IDs from utils API. */
 async function getUserAndOrgIds(bearer, reqId) {
   const url = `${GATEWAY_UTILS_BASE}/utils/GetUserOrgsWithToken`;
   dlog(`[${reqId}] POST ${url} (utils)`);
@@ -364,66 +348,136 @@ async function getUserAndOrgIds(bearer, reqId) {
   }
   const data = await safeJson(resp, reqId, 'getUserOrgsWithToken');
 
-  const userId = pickUserId(data);
-  const orgId = pickOrgId(data);
+  // Try robust parsing
+  const userId = pickUserIdRobust(data);
+  const orgId = pickOrgIdRobust(data);
+
+  dlog(`[${reqId}] utils parsed`, { userId, orgId });
+
   if (!userId || !orgId) throw new Error('Unable to resolve user/org ids from token');
   return { userId, orgId };
 }
 
-function pickUserId(data) {
-  const candidates = [
-    data?.userId,
-    data?.user?.id,
-    data?.user?.userId,
-    data?.profile?.userId,
-    data?.profile?.id,
-    data?.id
-  ];
-  for (const c of candidates) {
-    if (typeof c === 'number' || typeof c === 'string') return c;
-    if (c && typeof c === 'object' && (typeof c.id === 'number' || typeof c.id === 'string')) return c.id;
+/* ---------- Robust ID extraction ---------- */
+
+/** Unwrap common ID shapes: number | string | { Native } | { id } | nested. */
+function unwrapId(val) {
+  if (val == null) return null;
+  if (typeof val === 'number') return String(val);
+  if (typeof val === 'string') {
+    const s = val.trim();
+    if (s) return s;
+    return null;
+  }
+  if (typeof val === 'object') {
+    // Prefer Native then Id/id
+    if (val.Native != null) return unwrapId(val.Native);
+    if (val.native != null) return unwrapId(val.native);
+    if (val.Id != null) return unwrapId(val.Id);
+    if (val.ID != null) return unwrapId(val.ID);
+    if (val.id != null) return unwrapId(val.id);
+    // Sometimes it's { userId: X } or { orgId: X }
+    if (val.userId != null) return unwrapId(val.userId);
+    if (val.UserId != null) return unwrapId(val.UserId);
+    if (val.orgId != null) return unwrapId(val.orgId);
+    if (val.OrgId != null) return unwrapId(val.OrgId);
   }
   return null;
 }
 
-function pickOrgId(data) {
-  const candidates = [
-    data?.orgId,
-    data?.org,
-    data?.org?.id,
-    data?.orgs?.[0]?.orgId,
-    data?.orgs?.[0]?.id
-  ];
-  for (const c of candidates) {
-    if (typeof c === 'number' || typeof c === 'string') return c;
-    if (c && typeof c === 'object' && (typeof c.id === 'number' || typeof c.id === 'string')) return c.id;
+/** DFS search for the first value whose key (case-insensitive) is in `keys`. */
+function deepFindByKeys(obj, keys) {
+  const want = new Set(keys.map(k => String(k).toLowerCase()));
+  const seen = new Set();
+  function visit(node) {
+    if (!node || typeof node !== 'object') return null;
+    if (seen.has(node)) return null;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      for (const el of node) {
+        const r = visit(el);
+        if (r != null) return r;
+      }
+      return null;
+    }
+    for (const [k, v] of Object.entries(node)) {
+      const kl = k.toLowerCase();
+      if (want.has(kl)) {
+        const id = unwrapId(v);
+        if (id != null) return id;
+      }
+    }
+    for (const v of Object.values(node)) {
+      const r = visit(v);
+      if (r != null) return r;
+    }
+    return null;
   }
-  return null;
+  return visit(obj);
 }
 
-/**
- * Try multiple plausible endpoints/methods for "notes" or "emails".
- * Stops on first 200 with items.
- */
+/** Prefer user.userId/id, then any deep userId/id anywhere. */
+function pickUserIdRobust(data) {
+  // Try common shapes first
+  const u = data?.user ?? data?.User ?? null;
+  if (u) {
+    const id = unwrapId(u.userId ?? u.UserId ?? u.id ?? u.Id);
+    if (id) return id;
+  }
+  // Look inside user object with deep search
+  if (u) {
+    const id2 = deepFindByKeys(u, ['userId', 'id', 'native']);
+    if (id2) return id2;
+  }
+  // Fallback: deep search anywhere
+  const id3 = deepFindByKeys(data, ['userId', 'userid']);
+  if (id3) return id3;
+  // Last resort: if data has a top-level id that's clearly a user id
+  const id4 = unwrapId(data?.id ?? data?.Id);
+  return id4 || null;
+}
+
+/** Prefer default org from orgs array; else first org; else deep search. */
+function pickOrgIdRobust(data) {
+  const orgs = data?.orgs ?? data?.Orgs ?? null;
+  if (Array.isArray(orgs) && orgs.length) {
+    // Try to find default org
+    const defaultOrg = orgs.find(o =>
+      o?.isDefault === true || o?.IsDefault === true || o?.IsDefaultOrg === true || o?.isDefaultOrg === true || o?.default === true
+    ) || orgs[0];
+    const id = unwrapId(defaultOrg?.orgId ?? defaultOrg?.OrgId ?? defaultOrg?.id ?? defaultOrg?.Id ?? defaultOrg?.org?.id ?? defaultOrg?.Org?.Id);
+    if (id) return id;
+    // Deep search the default org object
+    const id2 = deepFindByKeys(defaultOrg, ['orgId', 'id', 'native']);
+    if (id2) return id2;
+  }
+  // Try top-level orgId
+  const idTop = unwrapId(data?.orgId ?? data?.OrgId);
+  if (idTop) return idTop;
+  // Deep search anywhere
+  const idDeep = deepFindByKeys(data, ['orgId']);
+  return idDeep || null;
+}
+
+/* ---------- data pulling ---------- */
+
 async function pullWithStrategies(kind, projectId, bearer, userId, orgId, reqId) {
   const limit = 100;
-  const baseHeaders = {
-    'Authorization': `Bearer ${bearer}`,
-    'x-fv-userid': String(userId),
-    'x-fv-orgid': String(orgId),
-    'Accept': 'application/json'
-  };
 
   const strategies = kind === 'emails'
     ? [
-        // Different tenants can expose emails under varying routes
         { label: 'GET emails project-scoped', method: 'GET', url: `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/emails` },
-        { label: 'GET emails feed',           method: 'GET', url: `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/feed?type=email` },
-        { label: 'GET notes filtered emails', method: 'GET', url: `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/notes?filterByType=email` }
+        { label: 'GET Emails project-scoped (caps)', method: 'GET', url: `${GATEWAY_REGION_BASE}/Projects/${encodeURIComponent(projectId)}/Emails` },
+        { label: 'GET feed type=email', method: 'GET', url: `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/feed?type=email` },
+        { label: 'GET Feed type=email (caps)', method: 'GET', url: `${GATEWAY_REGION_BASE}/Projects/${encodeURIComponent(projectId)}/Feed?type=email` },
+        { label: 'GET notes filtered emails', method: 'GET', url: `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/notes?filterByType=email` },
+        { label: 'GET Notes filtered emails (caps)', method: 'GET', url: `${GATEWAY_REGION_BASE}/Projects/${encodeURIComponent(projectId)}/Notes?filterByType=email` }
       ]
     : [
         { label: 'GET notes project-scoped', method: 'GET', url: `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/notes` },
-        { label: 'GET notes feed',           method: 'GET', url: `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/feed?type=note` }
+        { label: 'GET Notes project-scoped (caps)', method: 'GET', url: `${GATEWAY_REGION_BASE}/Projects/${encodeURIComponent(projectId)}/Notes` },
+        { label: 'GET feed type=note', method: 'GET', url: `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/feed?type=note` },
+        { label: 'GET Feed type=note (caps)', method: 'GET', url: `${GATEWAY_REGION_BASE}/Projects/${encodeURIComponent(projectId)}/Feed?type=note` }
       ];
 
   for (const strat of strategies) {
@@ -452,9 +506,16 @@ async function pullAllPagesWithOneRoute(strat, bearer, userId, orgId, limit, req
     url.searchParams.set('offset', String(offset));
 
     const hasBody = strat?.body && (strat.method || 'GET').toUpperCase() !== 'GET';
+    const headers = {
+      'Authorization': `Bearer ${bearer}`,
+      'x-fv-userid': String(userId),
+      'x-fv-orgid': String(orgId),
+      'Accept': 'application/json'
+    };
+
     const init = hasBody
-      ? { method: strat.method || 'POST', headers: { 'Authorization': `Bearer ${bearer}`, 'x-fv-userid': String(userId), 'x-fv-orgid': String(orgId), 'Accept': 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(strat.body) }
-      : { method: strat.method || 'GET',  headers: { 'Authorization': `Bearer ${bearer}`, 'x-fv-userid': String(userId), 'x-fv-orgid': String(orgId), 'Accept': 'application/json' } };
+      ? { method: strat.method || 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(strat.body) }
+      : { method: strat.method || 'GET',  headers };
 
     dlog(`[${reqId}] ${strat.label}`, { url: url.toString(), method: init.method });
 
@@ -466,11 +527,14 @@ async function pullAllPagesWithOneRoute(strat, bearer, userId, orgId, limit, req
     }
     const data = await safeJson(resp, reqId, tag);
 
-    const items = Array.isArray(data?.Items) ? data.Items : Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
+    const items = Array.isArray(data?.Items) ? data.Items
+               : Array.isArray(data?.items) ? data.items
+               : Array.isArray(data) ? data
+               : [];
     out.push(...items);
 
-    const count   = typeof data?.Count === 'number' ? data.Count : (Array.isArray(items) ? items.length : 0);
-    const limitR  = typeof data?.Limit === 'number' ? data.Limit : limit;
+    const count    = typeof data?.Count === 'number' ? data.Count : (Array.isArray(items) ? items.length : 0);
+    const limitR   = typeof data?.Limit === 'number' ? data.Limit : limit;
     const hasMoreR = Boolean(data?.HasMore ?? (count >= limitR));
 
     dlog(`[${reqId}] page`, { received: items.length, outLen: out.length, hasMoreR, offset });
@@ -592,7 +656,6 @@ function createdByLinkFromNote(note) {
 async function enrichNoteAuthors(notes, bearer, userId, orgId, reqId) {
   if (!Array.isArray(notes) || !notes.length) return;
 
-  // Which notes still lack an author name?
   const unresolved = notes.filter(n => {
     const already = n?.__author || extractNoteAuthor(n);
     return !already;
@@ -661,7 +724,7 @@ async function enrichNoteAuthors(notes, bearer, userId, orgId, reqId) {
     const users = n?._embedded?.users || n?.embedded?.users;
     if (Array.isArray(users)) {
       for (const u of users) {
-        const uid = String(u?.id ?? u?.userId ?? u?.native ?? '');
+        const uid = String(u?.id ?? u?.userId ?? u?.native ?? u?.Native ?? '');
         if (uid && idCandidates.includes(uid)) {
           const nm = pickName(u);
           if (nm) { n.__author = nm; break; }
@@ -674,14 +737,11 @@ async function enrichNoteAuthors(notes, bearer, userId, orgId, reqId) {
   dlog(`[${reqId}] author enrichments`, {
     totalNotes: notes.length,
     unresolvedBefore: unresolved.length,
-    unresolvedAfter: still,
-    halLinksFollowed: entries.length
+    unresolvedAfter: still
   });
 }
 
-/**
- * Final fallback: resolve note authors by user ID if name still missing.
- */
+/** Final fallback: resolve note authors by user ID if name still missing. */
 async function resolveNoteAuthorsById(notes, bearer, userId, orgId, reqId) {
   if (!Array.isArray(notes) || !notes.length) return;
   const pending = notes.filter(n => !(n?.__author || extractNoteAuthor(n)));
@@ -697,7 +757,6 @@ async function resolveNoteAuthorsById(notes, bearer, userId, orgId, reqId) {
       idMap.get(sid).push(n);
     }
   }
-
   if (!idMap.size) return;
 
   const headers = {
@@ -777,7 +836,7 @@ async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId,
   const limit = 50;
   const nid  = encodeURIComponent(String(noteId));
 
-  // 1) Try explicit per-item HAL link first (often "/notes/{id}/comments")
+  // 1) Try explicit per-item HAL link first
   if (explicitUrl) {
     const abs = toAbsoluteUrl(explicitUrl);
     try {
@@ -785,17 +844,21 @@ async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId,
         { label: 'GET link:comments', method: 'GET', url: abs },
         bearer, userId, orgId, limit, reqId, `comments[note:${noteId}]`
       );
-      if (Array.isArray(items) && items.length) { await enrichRawCommentAuthors(items, bearer, userId, orgId, reqId);
-      return normalizeComments(items); }
+      if (Array.isArray(items) && items.length) {
+        await enrichRawCommentAuthors(items, bearer, userId, orgId, reqId);
+        return normalizeComments(items);
+      }
     } catch (e) {
       dlog(`[${reqId}] comments explicit link failed`, { url: explicitUrl, abs, error: e?.message });
     }
   }
 
-  // 2) Fallback: global notes resource (NOT project-scoped) → /notes/{noteId}/comments
+  // 2) Fallbacks
   const strategies = [
     { label: 'GET notes/{id}/comments', method: 'GET', url: `${GATEWAY_REGION_BASE}/notes/${nid}/comments` },
-    { label: 'GET projects/{id}/notes/{id}/comments', method: 'GET', url: `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/notes/${nid}/comments` } // occasionally works in some tenants
+    { label: 'GET Notes/{id}/Comments (caps)', method: 'GET', url: `${GATEWAY_REGION_BASE}/Notes/${nid}/Comments` },
+    { label: 'GET projects/{id}/notes/{id}/comments', method: 'GET', url: `${GATEWAY_REGION_BASE}/projects/${encodeURIComponent(projectId)}/notes/${nid}/comments` },
+    { label: 'GET Projects/{id}/Notes/{id}/Comments (caps)', method: 'GET', url: `${GATEWAY_REGION_BASE}/Projects/${encodeURIComponent(projectId)}/Notes/${nid}/Comments` }
   ];
 
   for (const strat of strategies) {
@@ -803,8 +866,10 @@ async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId,
       const items = await pullAllPagesWithOneRoute(
         strat, bearer, userId, orgId, limit, reqId, `comments[note:${noteId}]`
       );
-      if (Array.isArray(items) && items.length) { await enrichRawCommentAuthors(items, bearer, userId, orgId, reqId);
-      return normalizeComments(items); }
+      if (Array.isArray(items) && items.length) {
+        await enrichRawCommentAuthors(items, bearer, userId, orgId, reqId);
+        return normalizeComments(items);
+      }
     } catch (e) {
       dlog(`[${reqId}] comments failed strategy`, { noteId, strategy: strat.label, error: e?.message });
     }
@@ -825,7 +890,6 @@ function normalizeComments(items) {
 
 /* ---------- fetch utils ---------- */
 
-/** Basic retry for idempotent GET/POST to mitigate transient errors. */
 async function fetchWithRetry(input, init = {}, reqId, retries = 2, delayMs = 250) {
   let attempt = 0;
   while (true) {
