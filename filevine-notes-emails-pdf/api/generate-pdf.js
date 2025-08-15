@@ -7,17 +7,335 @@ import PDFDocument from 'pdfkit';
  *  - FILEVINE_PAT_TOKEN
  *  - DEBUG (optional: "true" | "false"; default "true")
  *
- * New API gateway (global): api.filevineapp.com/fv-app/v2
- * Notes/comments are NOT project-scoped in v2; use /notes/{noteId}/comments.
+ * API gateway (global): https://api.filevineapp.com/fv-app/v2
+ * Notes/comments are not project-scoped in v2; use /notes/{noteId}/comments.
  */
 
 const IDENTITY_URL = 'https://identity.filevine.com/connect/token';
-const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2'; // non-regional
-const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2'; // keep global v2
+const GATEWAY_UTILS_BASE  = 'https://api.filevineapp.com/fv-app/v2';
+const GATEWAY_REGION_BASE = 'https://api.filevineapp.com/fv-app/v2';
 const DEBUG = (process.env.DEBUG ?? 'true').toLowerCase() !== 'false';
 
 const REQ = () => Math.random().toString(36).slice(2, 10);
 const dlog = (...args) => { if (DEBUG) console.log('[debug]', ...args); };
+
+/* ===========================
+   STATIC USER ID → NAME MAP
+   (derived from your sheet)
+   =========================== */
+const USER_ID_TO_NAME = {
+  "990003321": "Rebecca Gallicchio",
+  "990003322": "Adam Kotlar",
+  "990003902": "LeadDocket Integration",
+  "990003913": "Filevine Integration",
+  "990004437": "Taylor Bentsen",
+  "990004538": "Ali Cohen Goren",
+  "990004539": "Leslie Johnson",
+  "990004540": "Michelle Velykis",
+  "990004742": "Justin Cohen",
+  "990008308": "Periscopereports",
+  "990008411": "Khcfilevine",
+  "990008551": "Persicope Integration",
+  "990008711": "Client Access",
+  "990009268": "Alan Rosenberg",
+  "990009269": "Dan Levine",
+  "990009272": "Dan Paris",
+  "990009274": "Elizabeth Hernandez",
+  "990009275": "Stephanie Grassia",
+  "990009276": "Angela Santiago",
+  "990009277": "Michael Jagolinzer",
+  "990009278": "Tracy Grodnitzky",
+  "990009279": "Aja Showell",
+  "990009280": "Briana Toth",
+  "990009281": "Kyle Biller",
+  "990009282": "Jill Nuss",
+  "990009283": "David Segal",
+  "990009284": "Alexandra Sollee",
+  "990009285": "Wesley Hunter",
+  "990009286": "Lori Szeliga",
+  "990009287": "Samantha Kobylarz",
+  "990009288": "Lynda Thomas",
+  "990009289": "Giovanna Marchese",
+  "990009290": "Ariana Gonzales",
+  "990009291": "Devin McNally",
+  "990009292": "Marisa Shelkoff",
+  "990009293": "Nicole Friedman",
+  "990009294": "Matthew McDonald",
+  "990009295": "Robert Miller",
+  "990009296": "Alexandra Batte",
+  "990009297": "Jasmine Serrano",
+  "990009298": "Crystal Jones",
+  "990009299": "John Peculic",
+  "990009300": "Kathi Michalczyk",
+  "990009301": "Jessica Dodd",
+  "990009302": "Kris Scotten",
+  "990009303": "Lucero Novoa",
+  "990009304": "Maggie Algea",
+  "990009305": "Michael D'Amelio",
+  "990009306": "Nahir Vega",
+  "990009307": "Neysi Ortiz",
+  "990009308": "Rhianna Bavaro",
+  "990009309": "Sabrina Padilla",
+  "990009310": "Shawn Harris",
+  "990009311": "Sierra Jones",
+  "990009312": "Stephanie Belli",
+  "990009313": "Vanessa Jimenez",
+  "990009314": "Victoria Barreira",
+  "990009315": "Yareli De La Cruz",
+  "990009316": "Zoe Campos",
+  "990009317": "Aline Perez",
+  "990009318": "Gianna Piscopo",
+  "990009319": "Madison Dwyer",
+  "990009320": "Vicente Sarmiento",
+  "990009321": "Brittney-Ann Jones",
+  "990009322": "Eesha Moti",
+  "990009323": "Federica Orsi",
+  "990009324": "Hannah McGrath",
+  "990009325": "Isabella Gonzalez",
+  "990009326": "Janae Presley",
+  "990009327": "Leidy Dominguez",
+  "990009328": "Lindsay Valian",
+  "990009329": "Luz-Estela Villa",
+  "990009330": "Makaela Ascencio",
+  "990009331": "Maria-Camila Cuervo",
+  "990009332": "Mikayla King",
+  "990009333": "Miranda Faller",
+  "990009334": "Samantha Lucero",
+  "990009335": "Seema Yadav",
+  "990009336": "Stephanie Katz",
+  "990009337": "Talia Karolak",
+  "990009338": "Taylor McGrath",
+  "990009339": "Teresa Pena",
+  "990009340": "Victoria Correa",
+  "990009341": "Yolanda Terry",
+  "990009342": "Anthony Pegeron",
+  "990009343": "Hannah Schwartz",
+  "990009344": "Hannah Shuman",
+  "990009345": "Jay Rehan",
+  "990009346": "Kayla Mitchell",
+  "990009347": "Megan Johnson",
+  "990009348": "Nicole Foti",
+  "990009349": "Ryan Matyas",
+  "990009350": "Samantha Coleman",
+  "990009351": "Austin Miller",
+  "990009352": "Brianna Miller",
+  "990009353": "Charles Bader",
+  "990009354": "Christopher Toth",
+  "990009355": "Colin Toth",
+  "990009356": "Corrina McDonough",
+  "990009357": "Daniel Cohen",
+  "990009358": "Jake Rahn",
+  "990009359": "Jason Rozenberg",
+  "990009360": "Joshua Toth",
+  "990009361": "Justin Scott",
+  "990009362": "Kaitlyn Lutz",
+  "990009363": "Katherine Marchese",
+  "990009364": "Madeline Kolen",
+  "990009365": "Michelle Paredes",
+  "990009366": "Neethu Ittycheria",
+  "990009367": "Nicholas Nudo",
+  "990009368": "Shivani Malhotra",
+  "990009369": "Simone Jones",
+  "990009370": "Sofia Ochoa",
+  "990009371": "Sophie Perez",
+  "990009372": "Tara Grasso",
+  "990009373": "Taylor Campo",
+  "990009374": "Taylor Paglione",
+  "990009375": "Zachary Goldman",
+  "990009376": "Alexis Banet",
+  "990009377": "Brianna Powers",
+  "990009378": "Jenna Rosenthal",
+  "990009379": "Katherine Decker",
+  "990009380": "Michaela Gubin",
+  "990009381": "Natasha Kadam",
+  "990009382": "Noah Warhaftig",
+  "990009383": "Paola Marin",
+  "990009384": "Rachel Smith",
+  "990009385": "Sara Chillemi",
+  "990009386": "Shanel Wilson",
+  "990009387": "Steven Liske",
+  "990009388": "Yamileth Diaz",
+  "990009389": "Yedidya Zecharia",
+  "990009390": "Yoselin Castillo",
+  "990009391": "Zoe Krinsky",
+  "990009392": "Adam Vogel",
+  "990009393": "Anthony Dell'Osa",
+  "990009394": "Benjamin Gaines",
+  "990009395": "Danna Beren",
+  "990009396": "Derek Foti",
+  "990009397": "Fabiana Silva",
+  "990009398": "Gauri Madan",
+  "990009399": "Jake Eustice",
+  "990009400": "Lauren Ruggiero",
+  "990009401": "Madison Pincus",
+  "990009402": "Nishanth Khandavalli",
+  "990009403": "Rachel Oelsner",
+  "990009404": "Sasha Kirillova",
+  "990009405": "Shubh Ratre",
+  "990009406": "Sumit Sharma",
+  "990009407": "Tara Shah",
+  "990009408": "Yash Popat",
+  "990009409": "Yash Shah",
+  "990009410": "Ameira Rahimtoola",
+  "990009411": "Gaurav Agrawal",
+  "990009412": "Krishna Patel",
+  "990009413": "Natalie Khrom",
+  "990009414": "Nishkarsh Dewangan",
+  "990009415": "Samiksha Thakare",
+  "990009416": "Shrey Shah",
+  "990009417": "Shreyash Agrawal",
+  "990009418": "Ariella Hermann",
+  "990009419": "Brynn Lancellotti",
+  "990009420": "Carolina SR",
+  "990009421": "Danielle Lanzilotta",
+  "990009422": "Gabrielle Lovari",
+  "990009423": "George Kosmos",
+  "990009424": "Gianna Juras",
+  "990009425": "Giovanna Herreros",
+  "990009426": "Jenna McPartland",
+  "990009427": "Jessica Dini",
+  "990009428": "Jodi Miller",
+  "990009429": "Kayla Ruggiero",
+  "990009430": "Kirianna Alevras",
+  "990009431": "Kyra Scheid",
+  "990009432": "Lindsay D'Onofrio",
+  "990009433": "Madeline Williamson",
+  "990009434": "Madison Geller",
+  "990009435": "Marissa Kelly",
+  "990009436": "Maya Verma",
+  "990009437": "Nicole R",
+  "990009438": "Olivia Iton",
+  "990009439": "Rabiya Khan",
+  "990009440": "Rebecca Menkes",
+  "990009441": "Samantha Carifio",
+  "990009442": "Sanjana Desai",
+  "990009443": "Sheva Cherekaev",
+  "990009444": "Shreeya Gupta",
+  "990009445": "Sneha Mandal",
+  "990009446": "Toni-Ann D'Arrigo",
+  "990009447": "Victoria M",
+  "990009448": "Vimala M",
+  "990009449": "Yasmeen Alam",
+  "990009450": "Yasmin Shirazi",
+  "990009451": "Zoe Dorfan",
+  "990011544": "FV Administrator",
+  "990012173": "Neki Users",
+  "990012315": "Neki Users 2",
+  "990012582": "Anand Sharma",
+  "990012633": "Shruti Mishra",
+  "990012635": "Jaskaran",
+  "990013009": "Priyanka",
+  "990013031": "Dilip Kumar",
+  "990013079": "Shivam",
+  "990013221": "Pratik",
+  "990013261": "Puja",
+  "990013292": "Lucasrezende",
+  "990013558": "Susan Burleson",
+  "990013624": "Jordan Crisp",
+  "990014054": "Holly",
+  "990014083": "Sandra",
+  "990014108": "Daniela Ramirez",
+  "990014169": "Kaitlyn L",
+  "990014316": "Amber Duncan",
+  "990014394": "Alexandra Tsa",
+  "990014504": "Joni",
+  "990014507": "Niaz Fatima",
+  "990014640": "NZO",
+  "990014734": "Courtney Cerce",
+  "990014957": "Jagyeot",
+  "990015151": "Mary Hanna",
+  "990015199": "Shaik",
+  "990015200": "Evan Albrecht",
+  "990015252": "Adam Dheas",
+  "990015360": "Jessica Targino",
+  "990015553": "Brock",
+  "990015683": "Test",
+  "990015684": "User",
+  "990015760": "Michael Kunk",
+  "990016057": "Prasad",
+  "990016077": "Ravi",
+  "990016451": "Shradha",
+  "990016720": "Pratik Khedekar",
+  "990016784": "Rachel",
+  "990016796": "Aarthi",
+  "990016842": "Amar",
+  "990017118": "Genezen AI",
+  "990017194": "Chris Sutton",
+  "990017204": "Sukriti",
+  "990017219": "Konica",
+  "990017381": "1776",
+  "990017601": "Lakshmi",
+  "990017729": "Rishi",
+  "990017731": "Vikash",
+  "990018037": "Defne Başak",
+  "990018315": "Anushree",
+  "990018351": "Dheeraj",
+  "990018683": "nikita",
+  "990019131": "Monika",
+  "990019286": "Userrr",
+  "990019571": "Ashok",
+  "990019622": "Subashree",
+  "990019666": "fatima",
+  "990019680": "Munish",
+  "990019825": "Sofia",
+  "990019914": "Sajid",
+  "990020223": "Jaskirat",
+  "990020252": "Rachana",
+  "990020349": "Abhijeet",
+  "990020431": "Anita",
+  "990020483": "Shoaib",
+  "990020614": "User",
+  "990020841": "Terri Hiles",
+  "990021031": "Christopher Battles",
+  "990021076": "Nicole Butler-Teel",
+  "990021087": "Beatriz Lima",
+  "990021205": "Vinesign Integration",
+  "990021332": "Denielle Go",
+  "990021409": "Kori Sheridan",
+  "990021476": "Clei Narciso",
+  "990021479": "Maica",
+  "990021480": "Eileen McNally",
+  "990021584": "Nikki Fleischhauer",
+  "990021773": "Crystal Villa",
+  "990021913": "Doobie Okon",
+  "990022024": "Dean"
+};
+
+/* ======= helpers to use the map ======= */
+const nameFromMap = (id) => {
+  if (id == null) return '';
+  const key = typeof id === 'object'
+    ? (id.native ?? id.id ?? id.userId ?? id.value ?? null)
+    : id;
+  if (key == null) return '';
+  return USER_ID_TO_NAME[String(key)] || '';
+};
+
+const authorIdFromNote = (n) => {
+  const c = n || {};
+  const probe = (v) => (v && typeof v === 'object') ? (v.native ?? v.id ?? v.userId ?? null) : v;
+  return (
+    probe(c.createdById) ??
+    probe(c.createdByUserId) ??
+    probe(c.userId) ??
+    probe(c.authorId) ??
+    probe(c.createdBy?.id) ??
+    probe(c.createdBy?.native) ??
+    null
+  );
+};
+
+const authorIdFromComment = (c) => {
+  const probe = (v) => (v && typeof v === 'object') ? (v.native ?? v.id ?? v.userId ?? null) : v;
+  return (
+    probe(c?.__authorId) ??
+    probe(c?.createdById) ??
+    probe(c?.createdByUserId) ??
+    probe(c?.userId) ??
+    probe(c?.authorId) ??
+    null
+  );
+};
 
 export default async function handler(req, res) {
   const reqId = REQ();
@@ -62,30 +380,22 @@ export default async function handler(req, res) {
       reqId
     });
 
-    // 3c) Enrich authors for notes missing a clear author (follows HAL _links.createdBy, then /users/{id})
-    await enrichNoteAuthors(notesWithComments, token, userId, orgId, reqId);
-
-    // 3d) Enrich authors for comments that lack a name (resolve via /users/{id})
-    await enrichCommentAuthors(notesWithComments, token, userId, orgId, reqId);
-
-    // 3e) DEBUG: show the extracted/enriched author outcome for the first note
-    if (Array.isArray(notesWithComments) && notesWithComments.length) {
-      const first = notesWithComments[0];
-      dlog(`[${reqId}] First note author extracted`, {
-        extracted: extractNoteAuthor(first),
-        enriched: first?.__author ?? null
-      });
-    }
+    // 3c) Apply static ID→Name map to notes and comments (no extra API queries)
+    applyNameMapToNotesAndComments(notesWithComments, reqId);
+    applyNameMapToEmails(emails, reqId);
 
     // 4) Normalize + merge chronologically
     const merged = [
       ...notesWithComments.map((n, index) => {
         if (index === 0) debugDateFields([n], 'Note', reqId);
+        // Prefer the mapped author; if not found, fall back to any inline author info
+        const mappedAuthor = nameFromMap(authorIdFromNote(n));
+        const inlineAuthor = extractNoteAuthor(n);
         return {
           type: 'Note',
           id: normalizeId(n?.id ?? n?.noteId),
           created: extractDate(n, 'note'),
-          author: n?.__author || extractNoteAuthor(n), // ← prefer enriched, fallback to extractor
+          author: mappedAuthor || inlineAuthor || '',
           title: n?.title || n?.subject || '',
           body: n?.body || n?.text || n?.content || '',
           comments: Array.isArray(n?.comments) ? n.comments : []
@@ -93,11 +403,14 @@ export default async function handler(req, res) {
       }),
       ...emails.map((e, index) => {
         if (index === 0) debugDateFields([e], 'Email', reqId);
+        const mappedAuthor = nameFromMap(
+          e?.createdById ?? e?.createdByUserId ?? e?.userId ?? e?.authorId ?? e?.fromId
+        );
         return {
           type: 'Email',
           id: normalizeId(e?.id ?? e?.emailId),
           created: extractDate(e, 'email'),
-          author: extractAuthor(e),
+          author: mappedAuthor || extractAuthor(e),
           title: e?.subject || e?.title || '',
           body: e?.body || e?.content || e?.text || ''
         };
@@ -180,16 +493,14 @@ function normalizeId(v) {
   return String(v);
 }
 
-/** Generic author extractor used for emails/comments (hardened). */
+/** Generic author extractor used for emails/comments (kept as fallback). */
 function extractAuthor(obj) {
   if (!obj || typeof obj !== 'object') return '';
-  // Try to pick a name from any nested object fields first
   const nested = [obj.createdBy, obj.author, obj.user, obj.from, obj.sender];
   for (const cand of nested) {
     const name = pickName(cand);
     if (name) return name;
   }
-  // As a fallback, check direct `.name` properties
   if (obj.createdBy?.name) return String(obj.createdBy.name);
   if (obj.author?.name)   return String(obj.author.name);
   if (obj.user?.name)     return String(obj.user.name);
@@ -198,15 +509,13 @@ function extractAuthor(obj) {
   return '';
 }
 
-/** NOTE-SPECIFIC author extractor: checks common v2 shapes, including HAL. */
+/** NOTE-SPECIFIC author extractor (fallback when map misses). */
 function extractNoteAuthor(note) {
-  // 1) If HAL link exposes a title for the creator, prefer it
   const halCreatedBy =
     (note?._links?.createdBy && typeof note._links.createdBy === 'object' && note._links.createdBy.title) ||
     (note?.links?.createdBy && typeof note.links.createdBy === 'object' && note.links.createdBy.title);
   if (halCreatedBy && typeof halCreatedBy === 'string') return halCreatedBy;
 
-  // 2) Try rich/nested objects and common flat name fields
   const candidates = [
     note?.createdBy,
     note?.createdByUser,
@@ -234,7 +543,6 @@ function extractNoteAuthor(note) {
     if (name) return name;
   }
 
-  // 3) Check embedded users, if any, with ID matching
   const idCandidates = collectAuthorIdCandidates(note);
   const users = note?._embedded?.users || note?.embedded?.users;
   if (Array.isArray(users) && idCandidates.length) {
@@ -247,11 +555,9 @@ function extractNoteAuthor(note) {
     }
   }
 
-  // 4) Fallback to the generic extractor (covers some additional shapes)
   return extractAuthor(note);
 }
 
-/** Convert different object shapes into a name string. */
 function pickName(x) {
   if (!x) return '';
   if (typeof x === 'string') return x;
@@ -263,7 +569,6 @@ function pickName(x) {
       x.userFullName ||
       (x.firstName || x.lastName ? `${x.firstName ?? ''} ${x.lastName ?? ''}`.trim() : '');
     if (name) return String(name);
-    // Sometimes the HAL link object carries a title key
     if (x.title && typeof x.title === 'string') return x.title;
   }
   return '';
@@ -272,16 +577,24 @@ function pickName(x) {
 function collectAuthorIdCandidates(note) {
   const ids = [];
   const push = (v) => { if (v != null) ids.push(String(v)); };
-  push(note?.createdById);
-  push(note?.createdByUserId);
-  push(note?.userId);
-  push(note?.authorId);
+  push(normalizeIdMaybe(note?.createdById));
+  push(normalizeIdMaybe(note?.createdByUserId));
+  push(normalizeIdMaybe(note?.userId));
+  push(normalizeIdMaybe(note?.authorId));
   if (note?.createdBy && typeof note.createdBy === 'object') {
-    push(note.createdBy.id);
-    push(note.createdBy.userId);
-    push(note.createdBy.native);
+    push(normalizeIdMaybe(note.createdBy.id));
+    push(normalizeIdMaybe(note.createdBy.userId));
+    push(normalizeIdMaybe(note.createdBy.native));
   }
   return ids.filter(Boolean);
+}
+
+function normalizeIdMaybe(v) {
+  if (v == null) return null;
+  if (typeof v === 'object') {
+    return v.native ?? v.id ?? v.userId ?? null;
+  }
+  return v;
 }
 
 function debugNoteAuthorFields(notes, reqId) {
@@ -397,7 +710,6 @@ function stripHtml(html) {
 }
 
 function toAbsoluteUrl(pathOrUrl) {
-  // If Filevine returns a relative HAL link (e.g., "/users/{id}"), make it absolute.
   try {
     return new URL(pathOrUrl, GATEWAY_REGION_BASE).toString();
   } catch {
@@ -432,7 +744,7 @@ async function getBearerToken(reqId) {
   const data = await safeJson(resp, reqId, 'identity');
   if (!data.access_token) throw new Error('No access_token in identity response');
   dlog(`[${reqId}] Token acquired (length)`, { accessTokenLength: String(data.access_token).length });
-  return data.access_token; // never log token value
+  return data.access_token;
 }
 
 async function getUserAndOrgIds(bearer, reqId) {
@@ -488,8 +800,8 @@ function pickOrgId(data) {
 }
 
 /**
- * Try multiple plausible endpoints/methods for "notes" or "emails".
- * Stops on first 2xx and paginates with the same route.
+ * Pull "notes" or "emails" with multiple plausible routes.
+ * Stops on first 2xx and paginates with that route.
  */
 async function pullWithStrategies(kind, projectId, bearer, userId, orgId, reqId) {
   const limit = 50;
@@ -526,7 +838,6 @@ async function pullWithStrategies(kind, projectId, bearer, userId, orgId, reqId)
   throw new Error(`No ${kind} route matched; tried ${strategies.map(s => s.label).join(' | ')}`);
 }
 
-/** Pull all pages with a single route (GET query or POST body). */
 async function pullAllPagesWithOneRoute(strat, bearer, userId, orgId, limit, reqId, label) {
   const out = [];
   let offset = 0;
@@ -604,7 +915,6 @@ function inferHasMore(data, items, limit, _offset) {
   return items.length === limit;
 }
 
-/** Retry + logging for transient errors. */
 async function fetchWithRetry(input, init = {}, reqId, retries = 2, delayMs = 250) {
   let attempt = 0;
   while (true) {
@@ -693,24 +1003,15 @@ function extractEmbeddedComments(note) {
   ];
   const found = arrays.find(a => Array.isArray(a)) || [];
   return found.map(c => {
-    // Resolve name if present inline, else keep blank to be enriched later
-    const authorName = extractAuthor(c);
-    // Capture an author-id for enrichment if needed
-    let authorId = null;
-    if (c?.createdById) {
-      authorId = typeof c.createdById === 'object'
-                ? (c.createdById.native || c.createdById.id || c.createdById.userId)
-                : c.createdById;
-    }
-    if (!authorId) {
-      authorId = c?.createdByUserId || c?.userId || c?.authorId || null;
-    }
+    const id = authorIdFromComment(c);
+    const mapped = nameFromMap(id);
+    const authorName = mapped || extractAuthor(c);
     return ({
       id: normalizeId(c?.id ?? c?.commentId),
       created: extractDate(c, 'comment'),
       author: authorName,
       body: c?.body || c?.text || c?.content || '',
-      __authorId: authorId
+      __authorId: id ?? null
     });
   });
 }
@@ -780,7 +1081,7 @@ async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId,
   const limit = 50;
   const nid  = encodeURIComponent(String(noteId));
 
-  // 1) Try explicit per-item HAL link first (often "/notes/{id}/comments")
+  // 1) Try explicit link first (often "/notes/{id}/comments")
   if (explicitUrl) {
     const abs = toAbsoluteUrl(explicitUrl);
     try {
@@ -794,20 +1095,15 @@ async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId,
     }
   }
 
-  // 2) Fallback: global notes resource (NOT project-scoped) → /notes/{noteId}/comments
-  const strategies = [
-    { label: 'GET /notes/{id}/comments', method: 'GET', url: `${GATEWAY_REGION_BASE}/notes/${nid}/comments` }
-  ];
-
-  for (const strat of strategies) {
-    try {
-      const items = await pullAllPagesWithOneRoute(
-        strat, bearer, userId, orgId, limit, reqId, `comments[note:${noteId}]`
-      );
-      if (Array.isArray(items) && items.length) return normalizeComments(items);
-    } catch (e) {
-      dlog(`[${reqId}] comments failed strategy`, { noteId, strategy: strat.label, error: e?.message });
-    }
+  // 2) Fallback: global notes resource → /notes/{noteId}/comments
+  const strat = { label: 'GET /notes/{id}/comments', method: 'GET', url: `${GATEWAY_REGION_BASE}/notes/${nid}/comments` };
+  try {
+    const items = await pullAllPagesWithOneRoute(
+      strat, bearer, userId, orgId, limit, reqId, `comments[note:${noteId}]`
+    );
+    if (Array.isArray(items)) return normalizeComments(items);
+  } catch (e) {
+    dlog(`[${reqId}] comments failed strategy`, { noteId, strategy: strat.label, error: e?.message });
   }
 
   dlog(`[${reqId}] All comment strategies failed for note`, { noteId });
@@ -816,221 +1112,48 @@ async function getNoteComments({ projectId, noteId, explicitUrl, bearer, userId,
 
 function normalizeComments(items) {
   return items.map(c => {
-    // Determine author name if available
-    const authorName = extractAuthor(c);
-    // Capture the creator's ID (native user ID) for fallback enrichment
-    let authorId = null;
-    if (c?.createdById) {
-      authorId = typeof c.createdById === 'object'
-                ? (c.createdById.native || c.createdById.id || c.createdById.userId)
-                : c.createdById;
-    }
-    if (!authorId) {
-      authorId = c?.createdByUserId || c?.userId || c?.authorId || null;
-    }
+    const id = authorIdFromComment(c);
+    const mapped = nameFromMap(id);
+    const authorName = mapped || extractAuthor(c);
     return ({
       id: normalizeId(c?.id ?? c?.commentId),
       created: extractDate(c, 'comment'),
       author: authorName,
       body: c?.body || c?.text || c?.content || '',
-      __authorId: authorId
+      __authorId: id ?? null
     });
   });
 }
 
-/* ---------- author enrichment ---------- */
+/* ---------- map application ---------- */
 
-function createdByLinkFromNote(note) {
-  return (
-    (note?._links?.createdBy?.href || note?._links?.createdBy) ||
-    (note?.links?.createdBy?.href   || note?.links?.createdBy) ||
-    null
-  ) ? String((note?._links?.createdBy?.href || note?._links?.createdBy || note?.links?.createdBy?.href || note?.links?.createdBy)) : null;
+function applyNameMapToNotesAndComments(notes, reqId) {
+  if (!Array.isArray(notes)) return;
+  let noteCount = 0, commentCount = 0;
+
+  for (const n of notes) {
+    const nid = authorIdFromNote(n);
+    const nm = nameFromMap(nid);
+    if (nm) { n.__author = nm; noteCount++; }
+
+    if (Array.isArray(n.comments)) {
+      for (const c of n.comments) {
+        const cid = authorIdFromComment(c);
+        const cnm = nameFromMap(cid);
+        if (cnm) { c.author = cnm; commentCount++; }
+      }
+    }
+  }
+  dlog(`[applyNameMap] mapped authors`, { notes: noteCount, comments: commentCount });
 }
 
-/**
- * For notes whose author name isn't obvious, try to resolve it by:
- *  1) Following the HAL createdBy link (GET that URL, cache it, pick a name)
- *  2) If no HAL link, request /users/{creatorId} based on createdById-like fields
- *  3) Matching against _embedded.users (if present) by creator id
- */
-async function enrichNoteAuthors(notes, bearer, userId, orgId, reqId) {
-  if (!Array.isArray(notes) || !notes.length) return;
-
-  // Which notes still lack an author name?
-  const unresolved = notes.filter(n => {
-    const already = n?.__author || extractNoteAuthor(n);
-    return !already;
-  });
-  if (!unresolved.length) {
-    dlog(`[${reqId}] author enrichments`, { totalNotes: notes.length, unresolvedBefore: 0, unresolvedAfter: 0 });
-    return;
+function applyNameMapToEmails(emails, reqId) {
+  if (!Array.isArray(emails)) return;
+  let updated = 0;
+  for (const e of emails) {
+    const id = e?.createdById ?? e?.createdByUserId ?? e?.userId ?? e?.authorId ?? e?.fromId ?? null;
+    const nm = nameFromMap(id);
+    if (nm) { e.__author = nm; updated++; }
   }
-
-  // 1) Follow HAL createdBy links (dedup + cache)
-  const hrefToNotes = new Map();
-  for (const n of unresolved) {
-    const href = createdByLinkFromNote(n);
-    if (href) {
-      const abs = toAbsoluteUrl(href);
-      if (!hrefToNotes.has(abs)) hrefToNotes.set(abs, []);
-      hrefToNotes.get(abs).push(n);
-    } else {
-      // 2) Fallback: construct a user URL from the note's creator ID
-      let creatorId = null;
-      if (n?.createdById) {
-        creatorId = typeof n.createdById === 'object'
-          ? (n.createdById.native || n.createdById.id || n.createdById.userId)
-          : n.createdById;
-      }
-      if (!creatorId) creatorId = n?.createdByUserId || n?.userId || n?.authorId || null;
-      if (creatorId) {
-        const abs = toAbsoluteUrl(`/users/${creatorId}`);
-        if (!hrefToNotes.has(abs)) hrefToNotes.set(abs, []);
-        hrefToNotes.get(abs).push(n);
-      }
-    }
-  }
-
-  const entries = Array.from(hrefToNotes.entries());
-  const MAX_CONCURRENCY = Math.min(6, Math.max(1, entries.length));
-  let idx = 0;
-
-  async function worker() {
-    while (idx < entries.length) {
-      const [abs, bucket] = entries[idx++];
-      try {
-        const init = {
-          method: 'GET',
-          headers: {
-            'Authorization': `Bearer ${bearer}`,
-            'x-fv-userid': String(userId),
-            'x-fv-orgid': String(orgId),
-            'Accept': 'application/json'
-          }
-        };
-        dlog(`[${reqId}] GET ${abs} (author-resolve)`);
-        const resp = await fetchWithRetry(abs, init, reqId);
-        dlog(`[${reqId}] author-resolve response`, { status: resp.status });
-        if (!resp.ok) {
-          await logErrorBody(resp, reqId, 'author-resolve');
-          continue;
-        }
-        const data = await safeJson(resp, reqId, 'author-resolve');
-        const name =
-          pickName(data) ||
-          pickName(data?.user) ||
-          pickName(data?.person) ||
-          pickName(data?.profile) ||
-          data?.displayName ||
-          data?.fullName ||
-          data?.name ||
-          '';
-        if (name) {
-          for (const n of bucket) n.__author = name;
-        } else {
-          dlog(`[${reqId}] author-resolve no usable name`, { keys: Object.keys(data || {}) });
-        }
-      } catch (e) {
-        dlog(`[${reqId}] author-resolve failed`, { url: abs, error: e?.message });
-      }
-    }
-  }
-  await Promise.all(Array.from({ length: MAX_CONCURRENCY }, () => worker()));
-
-  // 3) Embedded users matching by id (for any still unresolved)
-  for (const n of unresolved) {
-    if (n.__author) continue;
-    const idCandidates = collectAuthorIdCandidates(n);
-    const users = n?._embedded?.users || n?.embedded?.users;
-    if (Array.isArray(users) && idCandidates.length) {
-      for (const u of users) {
-        const uid = String(u?.id ?? u?.userId ?? u?.native ?? '');
-        if (uid && idCandidates.includes(uid)) {
-          const nm = pickName(u);
-          if (nm) { n.__author = nm; break; }
-        }
-      }
-    }
-  }
-
-  const still = notes.filter(n => !(n.__author || extractNoteAuthor(n))).length;
-  dlog(`[${reqId}] author enrichments`, {
-    totalNotes: notes.length,
-    unresolvedBefore: unresolved.length,
-    unresolvedAfter: still,
-    halLinksFollowed: entries.length
-  });
-}
-
-/**
- * For comments that don't include a ready-made author name,
- * resolve via /users/{id} using the captured __authorId on each comment.
- */
-async function enrichCommentAuthors(notes, bearer, userId, orgId, reqId) {
-  if (!Array.isArray(notes) || !notes.length) return;
-
-  const userUrlMap = new Map(); // userUrl -> list of comment objects needing that user
-  for (const note of notes) {
-    if (!Array.isArray(note?.comments)) continue;
-    for (const c of note.comments) {
-      if (!c?.author) {
-        const uid = c?.__authorId;
-        if (!uid) continue;
-        const absUrl = toAbsoluteUrl(`/users/${uid}`);
-        if (!userUrlMap.has(absUrl)) userUrlMap.set(absUrl, []);
-        userUrlMap.get(absUrl).push(c);
-      }
-    }
-  }
-
-  if (userUrlMap.size === 0) {
-    dlog(`[${reqId}] Comment author enrichment: none needed (all names present)`);
-    return;
-  }
-
-  const entries = Array.from(userUrlMap.entries());
-  const MAX_CONCURRENCY = Math.min(6, entries.length);
-  let idx = 0;
-
-  async function worker() {
-    while (idx < entries.length) {
-      const [userUrl, commentList] = entries[idx++];
-      try {
-        dlog(`[${reqId}] GET ${userUrl} (comment-author-resolve)`);
-        const resp = await fetchWithRetry(userUrl, {
-          method: 'GET',
-          headers: {
-            'Authorization': `Bearer ${bearer}`,
-            'x-fv-userid': String(userId),
-            'x-fv-orgid': String(orgId),
-            'Accept': 'application/json'
-          }
-        }, reqId);
-        dlog(`[${reqId}] comment-author-resolve response`, { status: resp.status });
-        if (!resp.ok) {
-          await logErrorBody(resp, reqId, 'comment-author-resolve');
-          continue;
-        }
-        const data = await safeJson(resp, reqId, 'comment-author-resolve');
-        const name = pickName(data)
-          || pickName(data?.user)
-          || pickName(data?.person)
-          || pickName(data?.profile)
-          || data?.displayName
-          || data?.fullName
-          || data?.name
-          || '';
-        if (name) {
-          commentList.forEach(c => { c.author = name; });
-        } else {
-          dlog(`[${reqId}] comment-author-resolve: no name found`, { keys: Object.keys(data || {}) });
-        }
-      } catch (e) {
-        dlog(`[${reqId}] comment-author-resolve failed`, { url: userUrl, error: e?.message });
-      }
-    }
-  }
-  await Promise.all(Array.from({ length: MAX_CONCURRENCY }, () => worker()));
-  dlog(`[${reqId}] Comment author enrichment complete`, { totalUsers: userUrlMap.size });
+  dlog(`[applyNameMap] mapped email authors`, { emails: updated });
 }
